@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import os
+import ipaddress
 import re
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ from typing import Iterable
 
 MAC_RE = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 BAD_MAC_PREFIXES = ("ff:ff:ff:ff:ff:ff", "33:33:", "01:00:", "01:80:c2:")
+LOCAL_MULTICAST_IPS = ("224.", "239.", "255.255.255.255")
 
 
 def normalize_mac(value: str) -> str:
@@ -76,6 +78,51 @@ def uniq_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, str]]:
             seen.add(key)
             output.append(row)
     return output
+
+
+def split_multi(value: str) -> list[str]:
+    values: list[str] = []
+    for piece in re.split(r"\s*,\s*", value or ""):
+        piece = piece.strip()
+        if piece and piece not in values:
+            values.append(piece)
+    return values
+
+
+def row_values(row: dict[str, str], *field_names: str) -> list[str]:
+    values: list[str] = []
+    for field_name in field_names:
+        for value in split_multi(row.get(field_name, "")):
+            if value not in values:
+                values.append(value)
+    return values
+
+
+def first_row_value(row: dict[str, str], *field_names: str) -> str:
+    values = row_values(row, *field_names)
+    return values[0] if values else ""
+
+
+def field_present(row: dict[str, str], *field_names: str) -> bool:
+    return any(bool(row.get(field_name, "").strip()) for field_name in field_names)
+
+
+def infer_protocol(row: dict[str, str]) -> str:
+    protocols = (row.get("frame.protocols", "") or "").lower()
+    checks = [
+        ("DHCP", ("dhcp", "bootp"), ("dhcp.ip.your", "bootp.ip.your", "dhcp.option.hostname", "bootp.option.hostname")),
+        ("ARP", ("arp",), ("arp.src.proto_ipv4", "arp.dst.proto_ipv4")),
+        ("DNS", ("dns", "mdns", "llmnr", "nbns"), ("dns.qry.name", "dns.resp.name", "dns.srv.instance", "nbns.name")),
+        ("HTTP", ("http",), ("http.user_agent", "http.server", "http.host", "http.request.full_uri")),
+        ("TLS", ("tls", "ssl"), ("tls.handshake.extensions_server_name", "tls.handshake.ja3")),
+        ("TCP", ("tcp",), ("tcp.srcport", "tcp.dstport")),
+        ("UDP", ("udp",), ("udp.srcport", "udp.dstport")),
+        ("IP", ("ip",), ("ip.src", "ip.dst")),
+    ]
+    for label, proto_tokens, fields in checks:
+        if any(token in protocols for token in proto_tokens) or field_present(row, *fields):
+            return label
+    return ""
 
 
 def cipher_name(value: str) -> str:
@@ -182,6 +229,82 @@ def oui_prefix(mac: str) -> str:
     return ":".join(mac.split(":")[:3]).upper()
 
 
+def normalize_ip(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return value
+
+
+def is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def ip_scope(value: str) -> str:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return ""
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_multicast:
+        return "multicast"
+    if ip.is_link_local:
+        return "link-local"
+    if ip.is_private:
+        return "local/private"
+    if ip.is_global:
+        return "external/global"
+    return "special"
+
+
+def is_local_admin_mac(value: str) -> bool:
+    value = normalize_mac(value)
+    if not is_mac(value):
+        return False
+    return bool(int(value.split(":")[0], 16) & 0b10)
+
+
+def clean_hex(value: str) -> str:
+    return re.sub(r"[^0-9a-fA-F]", "", value or "").lower()
+
+
+def extract_gtks_from_key_data(value: str) -> set[str]:
+    data = clean_hex(value)
+    if len(data) < 16:
+        return set()
+    raw = bytes.fromhex(data)
+    gtks: set[str] = set()
+    index = 0
+    while index + 2 <= len(raw):
+        tag = raw[index]
+        if tag == 0x00:
+            index += 1
+            continue
+        if index + 2 > len(raw):
+            break
+        length = raw[index + 1]
+        end = index + 2 + length
+        if end > len(raw):
+            break
+        payload = raw[index + 2 : end]
+        # RSN GTK KDE: vendor-specific tag dd, OUI 00:0f:ac, data type 1,
+        # two key-info bytes, then the GTK itself.
+        if tag == 0xDD and len(payload) >= 22 and payload[:4] == b"\x00\x0f\xac\x01":
+            gtk = payload[6:]
+            if len(gtk) in {16, 24, 32}:
+                gtks.add(gtk.hex())
+        index = end
+    return gtks
+
+
 @dataclass
 class Evidence:
     source: str
@@ -245,6 +368,7 @@ class DeviceProfile:
     mac: str = ""
     bssids: set[str] = field(default_factory=set)
     ssids: set[str] = field(default_factory=set)
+    hostnames: set[str] = field(default_factory=set)
     vendor: str = ""
     make: str = ""
     model: str = ""
@@ -262,6 +386,23 @@ class DeviceProfile:
     handshakes: set[str] = field(default_factory=set)
     pmkids: set[str] = field(default_factory=set)
     ips: set[str] = field(default_factory=set)
+    peers: set[str] = field(default_factory=set)
+    dns_queries: set[str] = field(default_factory=set)
+    services: set[str] = field(default_factory=set)
+    dhcp_vendor_classes: set[str] = field(default_factory=set)
+    dhcp_parameter_lists: set[str] = field(default_factory=set)
+    dhcp_servers: set[str] = field(default_factory=set)
+    dhcp_routers: set[str] = field(default_factory=set)
+    dhcp_dns_servers: set[str] = field(default_factory=set)
+    dhcp_subnet_masks: set[str] = field(default_factory=set)
+    dhcp_requested_ips: set[str] = field(default_factory=set)
+    http_user_agents: set[str] = field(default_factory=set)
+    http_servers: set[str] = field(default_factory=set)
+    tls_sni: set[str] = field(default_factory=set)
+    tls_ja3: set[str] = field(default_factory=set)
+    device_type_scores: dict[str, int] = field(default_factory=dict)
+    device_type_evidence: dict[str, list[str]] = field(default_factory=dict)
+    role_hints: set[str] = field(default_factory=set)
     protocols: set[str] = field(default_factory=set)
     first_seen: str = ""
     last_seen: str = ""
@@ -297,6 +438,56 @@ class DeviceProfile:
 
 
 @dataclass
+class IPHostStats:
+    ip: str
+    source_frames: int = 0
+    destination_frames: int = 0
+    unicast_source_frames: int = 0
+    arp_replies: int = 0
+    arp_requests_for: int = 0
+    tcp_syn_sent: set[str] = field(default_factory=set)
+    tcp_synack_ports: set[str] = field(default_factory=set)
+    tcp_rst_ports: set[str] = field(default_factory=set)
+    udp_response_ports: set[str] = field(default_factory=set)
+    protocols: Counter = field(default_factory=Counter)
+    peers: Counter = field(default_factory=Counter)
+    scanned_targets: set[str] = field(default_factory=set)
+    scanned_by: set[str] = field(default_factory=set)
+    macs: set[str] = field(default_factory=set)
+    hostnames: set[str] = field(default_factory=set)
+    dns_queries: set[str] = field(default_factory=set)
+    services: set[str] = field(default_factory=set)
+    dhcp_vendor_classes: set[str] = field(default_factory=set)
+    dhcp_parameter_lists: set[str] = field(default_factory=set)
+    dhcp_servers: set[str] = field(default_factory=set)
+    dhcp_routers: set[str] = field(default_factory=set)
+    dhcp_dns_servers: set[str] = field(default_factory=set)
+    dhcp_subnet_masks: set[str] = field(default_factory=set)
+    dhcp_requested_ips: set[str] = field(default_factory=set)
+    dhcp_leases: set[str] = field(default_factory=set)
+    http_user_agents: set[str] = field(default_factory=set)
+    http_servers: set[str] = field(default_factory=set)
+    tls_sni: set[str] = field(default_factory=set)
+    tls_ja3: set[str] = field(default_factory=set)
+    first_frame: str = ""
+    last_frame: str = ""
+
+    def merge_frame(self, frame: str) -> None:
+        try:
+            frame_num = int(frame)
+        except (TypeError, ValueError):
+            return
+        if not self.first_frame or frame_num < int(self.first_frame):
+            self.first_frame = str(frame_num)
+        if not self.last_frame or frame_num > int(self.last_frame):
+            self.last_frame = str(frame_num)
+
+    @property
+    def total_frames(self) -> int:
+        return self.source_frames + self.destination_frames
+
+
+@dataclass
 class AnalysisResult:
     candidates: dict[str, Candidate] = field(default_factory=dict)
     profiles: dict[str, DeviceProfile] = field(default_factory=dict)
@@ -304,6 +495,13 @@ class AnalysisResult:
     ap_observation_rows: list[dict[str, str]] = field(default_factory=list)
     ssid_group_rows: list[dict[str, str]] = field(default_factory=list)
     client_rows: list[dict[str, str]] = field(default_factory=list)
+    ip_device_rows: list[dict[str, str]] = field(default_factory=list)
+    conversation_rows: list[dict[str, str]] = field(default_factory=list)
+    scan_rows: list[dict[str, str]] = field(default_factory=list)
+    service_rows: list[dict[str, str]] = field(default_factory=list)
+    open_service_rows: list[dict[str, str]] = field(default_factory=list)
+    closed_service_rows: list[dict[str, str]] = field(default_factory=list)
+    device_type_rows: list[dict[str, str]] = field(default_factory=list)
     security_rows: list[dict[str, str]] = field(default_factory=list)
     handshake_rows: list[dict[str, str]] = field(default_factory=list)
     decrypted_rows: list[dict[str, str]] = field(default_factory=list)
@@ -318,7 +516,7 @@ class AnalysisResult:
         labels: Iterable[str] = (),
         related: Iterable[str] = (),
     ) -> Candidate:
-        value = normalize_mac(value) if kind in {"BSSID", "Client", "Wired/Upstream", "MAC"} else value
+        value = normalize_mac(value) if kind in {"BSSID", "Client", "Wired/Upstream", "MAC"} else normalize_ip(value) if kind == "IP" else value
         key = f"{kind}:{value}"
         candidate = self.candidates.setdefault(key, Candidate(kind=kind, value=value))
         candidate.labels.update(label for label in labels if label)
@@ -329,8 +527,15 @@ class AnalysisResult:
         if kind in {"BSSID", "Client", "Wired/Upstream", "MAC"}:
             profile.mac = value
             profile.vendor = profile.vendor or oui_prefix(value)
+            if is_local_admin_mac(value):
+                profile.warnings.add("MAC is locally administered; it may be randomized")
         elif kind == "SSID":
             profile.ssids.add(value)
+        elif kind == "IP":
+            profile.ips.add(value)
+            profile.role_hints.add(ip_scope(value))
+        elif kind == "Hostname":
+            profile.hostnames.add(value)
         return candidate
 
     def profile_for(self, candidate: Candidate) -> DeviceProfile:
@@ -366,6 +571,13 @@ class AnalysisResult:
             "ap_observation_rows": self.ap_observation_rows,
             "ssid_group_rows": self.ssid_group_rows,
             "client_rows": self.client_rows,
+            "ip_device_rows": self.ip_device_rows,
+            "conversation_rows": self.conversation_rows,
+            "scan_rows": self.scan_rows,
+            "service_rows": self.service_rows,
+            "open_service_rows": self.open_service_rows,
+            "closed_service_rows": self.closed_service_rows,
+            "device_type_rows": self.device_type_rows,
             "security_rows": self.security_rows,
             "handshake_rows": self.handshake_rows,
             "decrypted_rows": self.decrypted_rows,
@@ -391,6 +603,13 @@ class AnalysisResult:
             ("AP observations", self.ap_observation_rows),
             ("SSID groups", self.ssid_group_rows),
             ("Client rows", self.client_rows),
+            ("IP devices", self.ip_device_rows),
+            ("Conversations", self.conversation_rows),
+            ("Scans", self.scan_rows),
+            ("Services", self.service_rows),
+            ("Open services", self.open_service_rows),
+            ("Closed/other services", self.closed_service_rows),
+            ("Device types", self.device_type_rows),
             ("Security rows", self.security_rows),
             ("Handshake rows", self.handshake_rows),
             ("Decrypted rows", self.decrypted_rows),
@@ -434,12 +653,19 @@ class TsharkRunner:
         self._valid_fields = fields
         return self._valid_fields
 
+    def has_field(self, field_name: str) -> bool:
+        valid = self.valid_fields()
+        return valid is None or field_name in valid
+
     def fields(
         self,
         file_path: str,
         display_filter: str,
         fields: list[str],
         decrypt: list[str] | None = None,
+        occurrence: str = "f",
+        aggregator: str = ",",
+        quiet_missing: bool = False,
     ) -> tuple[list[dict[str, str]], list[str]]:
         messages: list[str] = []
         valid_fields = self.valid_fields()
@@ -447,11 +673,13 @@ class TsharkRunner:
         if valid_fields:
             query_fields = [field_name for field_name in fields if field_name in valid_fields]
             missing_fields = [field_name for field_name in fields if field_name not in valid_fields]
-            if missing_fields:
+            if missing_fields and not quiet_missing:
                 messages.append(f"tshark does not expose these optional fields: {', '.join(missing_fields)}")
         command = [self.tshark_path, "-n", "-r", file_path]
         command.extend(decrypt or [])
-        command.extend(["-Y", display_filter, "-T", "fields", "-E", "separator=\t", "-E", "occurrence=f"])
+        command.extend(["-Y", display_filter, "-T", "fields", "-E", "separator=\t", "-E", f"occurrence={occurrence}"])
+        if occurrence == "a" and aggregator:
+            command.extend(["-E", f"aggregator={aggregator}"])
         for field_name in query_fields:
             command.extend(["-e", field_name])
         proc = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -475,6 +703,7 @@ class APAnalyzer:
         file_path: str,
         ssid: str = "",
         mac: str = "",
+        ip: str = "",
         mac_role: str = "Unknown",
         password: str = "",
         temporal_key: str = "",
@@ -483,22 +712,31 @@ class APAnalyzer:
         self.file_path = str(Path(file_path).expanduser())
         self.ssid = ssid.strip()
         self.mac = normalize_mac(mac)
+        self.ip = normalize_ip(ip)
         self.mac_role = mac_role
         self.password = password
         self.temporal_key = temporal_key.strip()
+        self.extracted_gtks: set[str] = set()
         self.runner = TsharkRunner(tshark_path)
         self.result = AnalysisResult()
 
     def _profile(self, kind: str, value: str) -> DeviceProfile:
-        value = normalize_mac(value) if kind in {"BSSID", "Client", "Wired/Upstream", "MAC"} else value
+        value = normalize_mac(value) if kind in {"BSSID", "Client", "Wired/Upstream", "MAC"} else normalize_ip(value) if kind == "IP" else value
         key = f"{kind}:{value}"
         profile = self.result.profiles.setdefault(key, DeviceProfile(key=key, role=kind))
         profile.role = kind
         if kind in {"BSSID", "Client", "Wired/Upstream", "MAC"}:
             profile.mac = value
             profile.vendor = profile.vendor or oui_prefix(value)
+            if is_local_admin_mac(value):
+                profile.warnings.add("MAC is locally administered; it may be randomized")
         elif kind == "SSID":
             profile.ssids.add(value)
+        elif kind == "IP":
+            profile.ips.add(value)
+            profile.role_hints.add(ip_scope(value))
+        elif kind == "Hostname":
+            profile.hostnames.add(value)
         return profile
 
     def _update_radio_profile(self, profile: DeviceProfile, row: dict[str, str]) -> None:
@@ -520,6 +758,17 @@ class APAnalyzer:
         profile.set_if_empty("uptime", row.get("wlan.fixed.timestamp", ""))
         profile.add_rssi(rssi)
 
+    def _profiles_for_mac(self, mac: str) -> list[DeviceProfile]:
+        mac = normalize_mac(mac)
+        profiles: list[DeviceProfile] = []
+        for kind in ["Client", "Wired/Upstream", "MAC", "BSSID"]:
+            key = f"{kind}:{mac}"
+            if key in self.result.candidates or key in self.result.profiles:
+                profiles.append(self._profile(kind, mac))
+        if not profiles and is_mac(mac):
+            profiles.append(self._profile("MAC", mac))
+        return profiles
+
     def analyze(self) -> AnalysisResult:
         self._record_user_inputs()
         if not Path(self.file_path).exists():
@@ -529,18 +778,49 @@ class APAnalyzer:
             self.result.messages.append("tshark was not found on PATH. Install Wireshark/tshark or enter a full tshark path.")
             return self.result
 
-        self._discover_aps()
-        self._inspect_security_and_handshakes()
-        self._classify_clients_and_upstream()
-        self._inspect_decrypted_traffic()
+        has_wlan = self.runner.has_field("wlan.bssid")
+        has_ip = self.runner.has_field("ip.src") or self.runner.has_field("arp.src.proto_ipv4")
+        capture_mode = "mixed wireless/IP" if has_wlan and has_ip else "wireless monitor-mode" if has_wlan else "Ethernet/IP" if has_ip else "unknown"
+        self.result.messages.append(f"Capture capability detected: {capture_mode}.")
+
+        if has_wlan:
+            self._discover_aps()
+            self._inspect_security_and_handshakes()
+            self._classify_clients_and_upstream()
+            self._extract_gtks()
+            self._inspect_decrypted_traffic()
+        else:
+            self.result.messages.append("No wlan.bssid field found; skipping monitor-mode wireless AP/client analysis.")
+        if has_ip:
+            self._inspect_ip_traffic()
+            decrypt = self._decrypt_options() if has_wlan else []
+            if decrypt:
+                key_sources = []
+                if self.password and self.ssid:
+                    key_sources.append("SSID/password")
+                if self.temporal_key:
+                    key_sources.append("manual TK/GTK")
+                if self.extracted_gtks:
+                    key_sources.append(f"{len(self.extracted_gtks)} extracted GTK(s)")
+                self.result.messages.append(f"Running decrypted IP/name analysis using: {', '.join(key_sources)}.")
+                self._inspect_ip_traffic(decrypt=decrypt, source_label="decrypted")
+        else:
+            self.result.messages.append("No IPv4/ARP fields found; skipping IP device analysis.")
         self.result.ap_observation_rows = uniq_rows(self.result.ap_observation_rows)
         self.result.ap_rows = self._summarize_ap_rows()
         self.result.ssid_group_rows = self._build_ssid_groups()
         self.result.client_rows = uniq_rows(self.result.client_rows)
+        self.result.ip_device_rows = self._summarize_ip_devices()
+        self.result.conversation_rows = uniq_rows(self.result.conversation_rows)
+        self.result.scan_rows = uniq_rows(self.result.scan_rows)
+        self.result.service_rows = uniq_rows(self.result.service_rows)
+        self.result.open_service_rows = uniq_rows(self.result.open_service_rows)
+        self.result.closed_service_rows = uniq_rows(self.result.closed_service_rows)
         self.result.security_rows = uniq_rows(self.result.security_rows)
         self.result.handshake_rows = uniq_rows(self.result.handshake_rows)
         self.result.decrypted_rows = uniq_rows(self.result.decrypted_rows)
         self._finalize_profiles()
+        self.result.device_type_rows = self._build_device_type_rows()
         return self.result
 
     def _summarize_ap_rows(self) -> list[dict[str, str]]:
@@ -660,6 +940,122 @@ class APAnalyzer:
                 profile.warnings.add("RSSI unavailable; capture may not include radiotap/radio metadata")
             if candidate.kind in {"Client", "Wired/Upstream", "MAC"} and not profile.bssids:
                 profile.warnings.add("No target BSSID relationship was confirmed for this MAC")
+            self._infer_device_types(candidate, profile)
+
+    def _add_device_type(self, profile: DeviceProfile, device_type: str, score: int, evidence: str) -> None:
+        profile.device_type_scores[device_type] = min(100, profile.device_type_scores.get(device_type, 0) + score)
+        evidence_list = profile.device_type_evidence.setdefault(device_type, [])
+        if evidence not in evidence_list:
+            evidence_list.append(evidence)
+
+    def _infer_device_types(self, candidate: Candidate, profile: DeviceProfile) -> None:
+        profile.device_type_scores.clear()
+        profile.device_type_evidence.clear()
+        text_parts = [
+            profile.vendor,
+            profile.make,
+            profile.model,
+            profile.mac,
+            " ".join(profile.hostnames),
+            " ".join(profile.dns_queries),
+            " ".join(profile.services),
+            " ".join(profile.protocols),
+            " ".join(profile.role_hints),
+            " ".join(profile.dhcp_vendor_classes),
+            " ".join(profile.dhcp_servers),
+            " ".join(profile.dhcp_routers),
+            " ".join(profile.dhcp_dns_servers),
+            " ".join(profile.http_user_agents),
+            " ".join(profile.http_servers),
+            " ".join(profile.tls_sni),
+        ]
+        text = " ".join(part for part in text_parts if part).lower()
+        services = " ".join(profile.services).lower()
+        protocols = {proto.upper() for proto in profile.protocols}
+        vendor = (profile.vendor or "").lower()
+
+        if candidate.kind == "BSSID" or "candidate-ap" in candidate.labels:
+            self._add_device_type(profile, "Access point", 70, "Device is observed as a BSSID/AP candidate")
+        if "wireless client" in profile.role_hints:
+            for dtype in ["Laptop", "Smartphone", "Tablet"]:
+                self._add_device_type(profile, dtype, 18, "Wireless client behavior without stronger device-specific clues")
+        if "wired/upstream/local LAN source" in profile.role_hints:
+            for dtype in ["Router", "Server", "Desktop PC"]:
+                self._add_device_type(profile, dtype, 15, "Wired/upstream local LAN source behavior")
+
+        rules: list[tuple[str, int, list[str], str]] = [
+            ("Network printer", 55, ["_ipp._tcp", "_printer", "ipp", "9100/tcp open", "631/tcp open", "515/tcp open", "printer", "brother", "canon", "epson", "laserjet", "officejet"], "Printing protocol/name/vendor clue"),
+            ("NAS", 45, ["synology", "qnap", "truenas", "freenas", "nas", "afp", "nfs", "smb", "445/tcp open", "548/tcp open", "2049/tcp open"], "Storage/SMB/NAS clue"),
+            ("Server", 35, ["22/tcp open", "80/tcp open", "443/tcp open", "8080/tcp open", "8443/tcp open", "linux", "ubuntu", "debian", "centos", "nginx", "apache"], "Server-like open service or software clue"),
+            ("Desktop PC", 35, ["445/tcp open", "3389/tcp open", "netbios", "nbns", "workstation", "windows", "microsoft"], "Workstation/Windows/SMB clue"),
+            ("VoIP phone", 60, ["sip", "5060", "5061", "polycom", "yealink", "grandstream", "cisco ip phone", "voip"], "VoIP protocol/vendor clue"),
+            ("IP camera", 55, ["rtsp", "554/tcp open", "8554/tcp open", "onvif", "hikvision", "dahua", "axis", "camera", "doorbell"], "Camera streaming/vendor clue"),
+            ("NVR/DVR", 55, ["nvr", "dvr", "hikvision", "dahua", "blueiris", "surveillance", "37777/tcp open", "8000/tcp open"], "Video recorder/surveillance clue"),
+            ("Smart TV", 50, ["mediarenderer", "dlna", "dIAL", "roku", "samsungtv", "lg smart", "bravia", "vizio", "airplay", "_airplay._tcp"], "Media renderer/TV discovery clue"),
+            ("Streaming stick", 55, ["googlecast", "chromecast", "roku", "firetv", "airplay", "_googlecast._tcp", "8008/tcp open", "8009/tcp open"], "Casting/streaming discovery clue"),
+            ("Game console", 45, ["xbox", "playstation", "nintendo", "ps5", "ps4", "xboxone"], "Game-console hostname/vendor clue"),
+            ("Router", 45, ["router", "gateway", "internetgatewaydevice", "dns server", "dhcp server", "53/udp response", "67/udp response"], "Gateway/DNS/DHCP behavior clue"),
+            ("Firewall", 35, ["firewall", "pfsense", "opnsense", "fortinet", "sonicwall", "palo alto"], "Firewall vendor/name clue"),
+            ("Switch", 35, ["switch", "lldp", "cdp", "procurve", "aruba", "catalyst"], "Switch/vendor/discovery clue"),
+            ("Raspberry Pi / SBC", 55, ["raspberry", "raspberry pi", "rpi", "raspbian", "octopi"], "SBC hostname/vendor clue"),
+            ("Smart speaker", 50, ["alexa", "echo", "sonos", "homepod", "google home", "speaker"], "Smart speaker discovery/name clue"),
+            ("Smart display", 45, ["nest hub", "echo show", "smart display", "googlecast"], "Smart display/casting clue"),
+            ("Thermostat", 55, ["thermostat", "ecobee", "nest thermostat", "honeywell"], "Thermostat name/vendor clue"),
+            ("Smart plug", 45, ["smartplug", "smart plug", "kasa", "tplink-smarthome", "wemo"], "Smart plug name/vendor clue"),
+            ("Smart bulb", 45, ["hue", "lifx", "bulb", "lighting"], "Smart lighting discovery/name clue"),
+            ("Smart hub/bridge", 45, ["bridge", "hub", "zigbee", "zwave", "hue bridge", "smartthings"], "Smart home bridge/hub clue"),
+            ("Robot vacuum", 55, ["roomba", "irobot", "vacuum", "robovac"], "Robot vacuum name/vendor clue"),
+            ("POS terminal", 45, ["pos", "verifone", "ingenico", "payment", "terminal"], "Payment/POS name/vendor clue"),
+            ("Thin client", 40, ["thinclient", "wyse", "igel", "citrix"], "Thin-client name/vendor clue"),
+            ("UPS network card", 45, ["ups", "apc", "tripplite", "eaton"], "UPS vendor/name clue"),
+            ("Hypervisor host", 45, ["vmware", "esxi", "hyper-v", "proxmox", "xenserver"], "Hypervisor name/vendor clue"),
+            ("Virtual machine", 40, ["vmware", "virtualbox", "qemu", "kvm", "parallels", "hyper-v"], "Virtualization OUI/name clue"),
+            ("Media server", 45, ["plex", "jellyfin", "emby", "dlna", "mediaserver"], "Media server service/name clue"),
+        ]
+        for dtype, score, needles, evidence in rules:
+            matches = [needle for needle in needles if needle.lower() in text or needle.lower() in services]
+            if matches:
+                self._add_device_type(profile, dtype, min(90, score + min(25, (len(matches) - 1) * 6)), f"{evidence}: {', '.join(matches[:5])}")
+
+        if "Apple".lower() in vendor or any(x in text for x in ["iphone", "ipad", "macbook", "ios", "darwin"]):
+            if any(x in text for x in ["iphone", "ios"]):
+                self._add_device_type(profile, "Smartphone", 65, "Apple/iPhone/iOS clue")
+            if any(x in text for x in ["ipad"]):
+                self._add_device_type(profile, "Tablet", 65, "Apple/iPad clue")
+            if any(x in text for x in ["macbook", "imac", "macos", "darwin"]):
+                self._add_device_type(profile, "Laptop", 45, "Apple macOS clue")
+        if any(x in text for x in ["android", "samsung", "pixel", "oneplus"]):
+            self._add_device_type(profile, "Smartphone", 45, "Android/mobile vendor or hostname clue")
+        if "TCP service responder" in profile.role_hints and not profile.device_type_scores:
+            self._add_device_type(profile, "Server", 25, "Responds with open TCP service but lacks device-specific clues")
+        if "scanner" in profile.role_hints:
+            self._add_device_type(profile, "Desktop PC", 20, "Scan behavior often originates from an admin workstation")
+
+    def _top_device_types(self, profile: DeviceProfile, limit: int = 10) -> list[tuple[str, int, list[str]]]:
+        return [
+            (dtype, score, profile.device_type_evidence.get(dtype, []))
+            for dtype, score in sorted(profile.device_type_scores.items(), key=lambda item: (-item[1], item[0]))[:limit]
+        ]
+
+    def _build_device_type_rows(self) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for candidate in self.result.sorted_candidates():
+            profile = self.result.profile_for(candidate)
+            top = self._top_device_types(profile, 10)
+            if not top:
+                continue
+            best_type, best_score, best_evidence = top[0]
+            rows.append(
+                {
+                    "Kind": candidate.kind,
+                    "Value": candidate.value,
+                    "Best Guess": best_type,
+                    "Confidence": f"{best_score}%",
+                    "Alternatives": ", ".join(f"{dtype} {score}%" for dtype, score, _ in top[1:5]),
+                    "Top Evidence": "; ".join(best_evidence[:3]),
+                }
+            )
+        return rows
 
     def _record_user_inputs(self) -> None:
         if self.ssid:
@@ -675,6 +1071,13 @@ class APAnalyzer:
                 kind,
                 self.mac,
                 Evidence("User input", f"MAC supplied by user with role set to {self.mac_role}.", 25),
+                labels=["input"],
+            )
+        if self.ip:
+            self.result.add_candidate(
+                "IP",
+                self.ip,
+                Evidence("User input", "IP supplied by user; Ethernet/IP traffic searches will be anchored to it.", 25),
                 labels=["input"],
             )
 
@@ -824,7 +1227,7 @@ class APAnalyzer:
                 profile.warnings.add(f"MFP capable: {row.get('wlan.rsn.capabilities.mfpc')}")
 
         hs_filter = f"({self._bssid_filter()}) && (eapol || wlan.rsn.ie.pmkid)"
-        hs_fields = ["frame.number", "wlan.bssid", "wlan.sa", "wlan.da", "wlan_rsna_eapol.keydes.msgnr", "wlan.rsn.ie.pmkid"]
+        hs_fields = ["frame.number", "wlan.bssid", "wlan.sa", "wlan.da", "wlan_rsna_eapol.keydes.msgnr", "wlan.rsn.ie.pmkid", "wlan.rsn.ie.gtk_kde.gtk"]
         rows, messages = self.runner.fields(self.file_path, hs_filter, hs_fields)
         self.result.messages.extend(messages)
         for row in rows:
@@ -833,7 +1236,10 @@ class APAnalyzer:
                 continue
             msg = row.get("wlan_rsna_eapol.keydes.msgnr", "")
             pmkid = row.get("wlan.rsn.ie.pmkid", "")
+            gtk = clean_hex(row.get("wlan.rsn.ie.gtk_kde.gtk", ""))
             why = "PMKID observed" if pmkid else f"EAPOL handshake message {msg or 'observed'}"
+            if gtk:
+                why = f"{why}; GTK KDE decrypted"
             self.result.handshake_rows.append(
                 {
                     "Frame": row.get("frame.number", ""),
@@ -842,6 +1248,7 @@ class APAnalyzer:
                     "Destination": normalize_mac(row.get("wlan.da", "")),
                     "EAPOL Msg": msg,
                     "PMKID": pmkid,
+                    "GTK": gtk,
                     "Why": why,
                 }
             )
@@ -851,6 +1258,9 @@ class APAnalyzer:
                 profile.handshakes.add(f"EAPOL message {msg}")
             if pmkid:
                 profile.pmkids.add(pmkid)
+            if gtk:
+                self.extracted_gtks.add(gtk)
+                profile.services.add(f"GTK {gtk[:8]}...")
 
     def _classify_clients_and_upstream(self) -> None:
         display_filter = f"({self._bssid_filter()}) && wlan.fc.type == 2"
@@ -888,6 +1298,11 @@ class APAnalyzer:
             self.result.add_candidate("Client", client, Evidence("Client classification", reason, 35, {"BSSID": bssid, "MAC": client}), labels=["wireless-client"], related=[bssid])
             profile = self._profile("Client", client)
             profile.bssids.add(bssid)
+            profile.role_hints.add("wireless client")
+            bssid_profile = self._profile("BSSID", bssid)
+            profile.ssids.update(bssid_profile.ssids)
+            if is_local_admin_mac(client):
+                profile.warnings.add("Client MAC is locally administered; it may be randomized")
             self._update_radio_profile(profile, row)
 
         for (bssid, mac), row in sorted(upstream_seen.items()):
@@ -898,27 +1313,63 @@ class APAnalyzer:
             self.result.add_candidate("Wired/Upstream", mac, Evidence("Upstream classification", reason, 25, {"BSSID": bssid, "MAC": mac}), labels=["wired-or-upstream"], related=[bssid])
             profile = self._profile("Wired/Upstream", mac)
             profile.bssids.add(bssid)
+            profile.role_hints.add("wired/upstream/local LAN source")
+            bssid_profile = self._profile("BSSID", bssid)
+            profile.ssids.update(bssid_profile.ssids)
             self._update_radio_profile(profile, row)
 
     def _decrypt_options(self) -> list[str]:
         opts: list[str] = []
         if self.password and self.ssid:
             opts.extend(["-o", "wlan.enable_decryption:TRUE", "-o", f'uat:80211_keys:"wpa-pwd","{self.password}:{self.ssid}"'])
+        keys = []
         if self.temporal_key:
+            keys.append(self.temporal_key)
+        keys.extend(sorted(self.extracted_gtks))
+        for key in keys:
             if "-o" not in opts:
                 opts.extend(["-o", "wlan.enable_decryption:TRUE"])
-            opts.extend(["-o", f'uat:80211_keys:"tk","{self.temporal_key}"'])
+            opts.extend(["-o", f'uat:80211_keys:"tk","{key}"'])
         return opts
+
+    def _extract_gtks(self) -> None:
+        if not (self.password and self.ssid):
+            return
+        decrypt = ["-o", "wlan.enable_decryption:TRUE", "-o", f'uat:80211_keys:"wpa-pwd","{self.password}:{self.ssid}"']
+        display_filter = "wlan_rsna_eapol.keydes.msgnr == 3"
+        fields = ["wlan.bssid", "wlan.sa", "wlan.da", "wlan.rsn.ie.gtk_kde.gtk", "wlan.rsn.ie.gtk.key", "wlan_rsna_eapol.keydes.data", "wlan_rsna_eapol.keydes.data_len"]
+        rows, messages = self.runner.fields(self.file_path, display_filter, fields, decrypt=decrypt)
+        self.result.messages.extend(messages)
+        for row in rows:
+            src = normalize_mac(row.get("wlan.sa", ""))
+            dst = normalize_mac(row.get("wlan.da", ""))
+            bssid = normalize_mac(row.get("wlan.bssid", ""))
+            gtks = set()
+            gtk_kde = clean_hex(row.get("wlan.rsn.ie.gtk_kde.gtk", ""))
+            if gtk_kde:
+                gtks.add(gtk_kde)
+            direct_gtk = clean_hex(row.get("wlan.rsn.ie.gtk.key", ""))
+            if direct_gtk:
+                gtks.add(direct_gtk)
+            gtks.update(extract_gtks_from_key_data(row.get("wlan_rsna_eapol.keydes.data", "")))
+            for gtk in sorted(gtks):
+                if gtk in self.extracted_gtks:
+                    continue
+                self.extracted_gtks.add(gtk)
+                self.result.messages.append(f"Extracted GTK from EAPOL message 3 for {bssid or 'unknown BSSID'}: {gtk[:8]}... ({src} -> {dst})")
+        if self.password and self.ssid and not self.extracted_gtks:
+            self.result.messages.append("SSID/password decryption was attempted, but no GTK KDE was parsed from EAPOL message 3 key data.")
 
     def _inspect_decrypted_traffic(self) -> None:
         decrypt = self._decrypt_options()
         if not decrypt:
             return
         display_filter = f"({self._bssid_filter()}) && (ip || arp || ipv6)"
-        fields = ["frame.number", "_ws.col.Protocol", "wlan.bssid", "wlan.sa", "wlan.da", "ip.src", "ip.dst", "ipv6.src", "ipv6.dst", "arp.src.proto_ipv4", "arp.dst.proto_ipv4"]
-        rows, messages = self.runner.fields(self.file_path, display_filter, fields, decrypt=decrypt)
+        fields = ["frame.number", "frame.protocols", "wlan.bssid", "wlan.sa", "wlan.da", "ip.src", "ip.dst", "ipv6.src", "ipv6.dst", "arp.src.proto_ipv4", "arp.dst.proto_ipv4"]
+        rows, messages = self.runner.fields(self.file_path, display_filter, fields, decrypt=decrypt, quiet_missing=True)
         self.result.messages.extend(messages)
         for row in rows:
+            protocol = infer_protocol(row)
             bssid = normalize_mac(row.get("wlan.bssid", ""))
             src_ip = row.get("ip.src") or row.get("ipv6.src") or row.get("arp.src.proto_ipv4", "")
             dst_ip = row.get("ip.dst") or row.get("ipv6.dst") or row.get("arp.dst.proto_ipv4", "")
@@ -927,7 +1378,7 @@ class APAnalyzer:
             self.result.decrypted_rows.append(
                 {
                     "Frame": row.get("frame.number", ""),
-                    "Protocol": row.get("_ws.col.Protocol", ""),
+                    "Protocol": protocol,
                     "BSSID": bssid,
                     "Source MAC": src_mac,
                     "Destination MAC": dst_mac,
@@ -938,7 +1389,7 @@ class APAnalyzer:
             for mac, label, ip in [(src_mac, "decrypted-source", src_ip), (dst_mac, "decrypted-destination", dst_ip)]:
                 if is_noise_mac(mac):
                     continue
-                reason = f"MAC appeared in decrypted {row.get('_ws.col.Protocol', 'traffic')} traffic"
+                reason = f"MAC appeared in decrypted {protocol or 'traffic'} traffic"
                 if ip:
                     reason += f" with IP {ip}"
                 self.result.add_candidate("MAC", mac, Evidence("Decrypted traffic", reason, 20, row), labels=[label], related=[bssid, ip])
@@ -946,9 +1397,484 @@ class APAnalyzer:
                 profile.bssids.add(bssid)
                 if ip:
                     profile.ips.add(ip)
-                if row.get("_ws.col.Protocol", ""):
-                    profile.protocols.add(row.get("_ws.col.Protocol", ""))
+                if protocol:
+                    profile.protocols.add(protocol)
                 self._update_radio_profile(profile, row)
+                for linked_profile in self._profiles_for_mac(mac):
+                    if ip:
+                        linked_profile.ips.add(ip)
+                    if protocol:
+                        linked_profile.protocols.add(protocol)
+                    if bssid and not is_noise_mac(bssid):
+                        linked_profile.bssids.add(bssid)
+
+    def _inspect_ip_traffic(self, decrypt: list[str] | None = None, source_label: str = "cleartext") -> None:
+        display_filter = "ip || arp || ipv6"
+        fields = [
+            "frame.number",
+            "frame.protocols",
+            "eth.src",
+            "eth.dst",
+            "wlan.sa",
+            "wlan.da",
+            "wlan.bssid",
+            "ip.src",
+            "ip.dst",
+            "arp.src.hw_mac",
+            "arp.dst.hw_mac",
+            "arp.src.proto_ipv4",
+            "arp.dst.proto_ipv4",
+            "arp.opcode",
+            "dhcp.ip.your",
+            "bootp.ip.your",
+            "dhcp.ip.server",
+            "bootp.ip.server",
+            "dhcp.hw.mac_addr",
+            "bootp.hw.mac_addr",
+            "dhcp.option.hostname",
+            "bootp.option.hostname",
+            "dhcp.fqdn.name",
+            "dhcp.option.dhcp_server_id",
+            "bootp.option.dhcp_server_id",
+            "dhcp.option.domain_name_server",
+            "bootp.option.domain_name_server",
+            "dhcp.option.subnet_mask",
+            "bootp.option.subnet_mask",
+            "dhcp.option.router",
+            "bootp.option.router",
+            "dhcp.option.requested_ip_address",
+            "bootp.option.requested_ip_address",
+            "dhcp.option.vendor_class_id",
+            "bootp.option.vendor_class_id",
+            "dhcp.option.request_list_item",
+            "bootp.option.request_list_item",
+            "bootp.option.parameter_request_list",
+            "dhcp.option.user_class",
+            "bootp.option.user_class",
+            "dns.qry.name",
+            "dns.resp.name",
+            "dns.ptr.domain_name",
+            "dns.srv.instance",
+            "dns.srv.name",
+            "dns.srv.service",
+            "dns.srv.proto",
+            "dns.srv.target",
+            "dns.srv.port",
+            "dns.a",
+            "dns.aaaa",
+            "nbns.name",
+            "http.user_agent",
+            "http.server",
+            "http.host",
+            "http.request.full_uri",
+            "tls.handshake.extensions_server_name",
+            "tls.handshake.ja3",
+            "tcp.srcport",
+            "tcp.dstport",
+            "tcp.flags.syn",
+            "tcp.flags.ack",
+            "tcp.flags.reset",
+            "udp.srcport",
+            "udp.dstport",
+        ]
+        rows, messages = self.runner.fields(self.file_path, display_filter, fields, decrypt=decrypt, occurrence="a", aggregator=",", quiet_missing=True)
+        self.result.messages.extend(messages)
+        if not rows:
+            if decrypt:
+                self.result.messages.append("Decryption options were supplied, but no decrypted IP/ARP/name traffic was found.")
+            return
+        if decrypt:
+            self.result.messages.append(f"Decrypted IP/name analysis found {len(rows)} matching frames.")
+        else:
+            self.result.messages.append(f"Cleartext IP/name analysis found {len(rows)} matching frames.")
+
+        stats_by_ip: dict[str, IPHostStats] = {}
+        conversation_counter: Counter[tuple[str, str, str, str, str, str, str]] = Counter()
+
+        def stats(ip: str) -> IPHostStats:
+            ip = normalize_ip(ip)
+            stats_by_ip.setdefault(ip, IPHostStats(ip=ip))
+            return stats_by_ip[ip]
+
+        for row in rows:
+            protocol = infer_protocol(row)
+            frame = row.get("frame.number", "")
+            dhcp_client_mac = normalize_mac(first_row_value(row, "dhcp.hw.mac_addr", "bootp.hw.mac_addr"))
+            src_mac = normalize_mac(row.get("eth.src") or row.get("wlan.sa") or row.get("arp.src.hw_mac") or dhcp_client_mac)
+            dst_mac = normalize_mac(row.get("eth.dst") or row.get("wlan.da") or row.get("arp.dst.hw_mac", ""))
+            src_ip = normalize_ip(row.get("ip.src") or row.get("arp.src.proto_ipv4", ""))
+            assigned_ip = normalize_ip(first_row_value(row, "dhcp.ip.your", "bootp.ip.your"))
+            dst_ip = normalize_ip(row.get("ip.dst") or row.get("arp.dst.proto_ipv4") or assigned_ip)
+            bssid = normalize_mac(row.get("wlan.bssid", ""))
+            src_port = first_row_value(row, "tcp.srcport", "udp.srcport")
+            dst_port = first_row_value(row, "tcp.dstport", "udp.dstport")
+            udp_src_ports = row_values(row, "udp.srcport")
+            syn = row.get("tcp.flags.syn") in {"1", "True", "true"}
+            ack = row.get("tcp.flags.ack") in {"1", "True", "true"}
+            rst = row.get("tcp.flags.reset") in {"1", "True", "true"}
+            arp_opcode = row.get("arp.opcode", "")
+            dhcp_hostnames = row_values(row, "dhcp.option.hostname", "bootp.option.hostname", "dhcp.fqdn.name")
+            dhcp_servers = [normalize_ip(value) for value in row_values(row, "dhcp.option.dhcp_server_id", "bootp.option.dhcp_server_id", "dhcp.ip.server", "bootp.ip.server") if is_ip(normalize_ip(value))]
+            dhcp_dns_servers = [normalize_ip(value) for value in row_values(row, "dhcp.option.domain_name_server", "bootp.option.domain_name_server") if is_ip(normalize_ip(value))]
+            dhcp_routers = [normalize_ip(value) for value in row_values(row, "dhcp.option.router", "bootp.option.router") if is_ip(normalize_ip(value))]
+            dhcp_requested_ips = [normalize_ip(value) for value in row_values(row, "dhcp.option.requested_ip_address", "bootp.option.requested_ip_address") if is_ip(normalize_ip(value))]
+            dhcp_subnet_masks = row_values(row, "dhcp.option.subnet_mask", "bootp.option.subnet_mask")
+            dns_queries = row_values(row, "dns.qry.name", "dns.ptr.domain_name", "nbns.name")
+            dns_answers = row_values(row, "dns.resp.name", "dns.srv.instance", "dns.srv.name", "dns.srv.target")
+            service_names = row_values(row, "dns.srv.instance", "dns.srv.name", "dns.ptr.domain_name")
+            dns_answer_ips = [normalize_ip(value) for value in row_values(row, "dns.a", "dns.aaaa") if is_ip(normalize_ip(value))]
+            http_values = row_values(row, "http.host", "http.request.full_uri")
+            tls_sni = row_values(row, "tls.handshake.extensions_server_name")
+
+            if is_ip(src_ip):
+                src_stats = stats(src_ip)
+                src_stats.source_frames += 1
+                src_stats.merge_frame(frame)
+                if protocol:
+                    src_stats.protocols[protocol] += 1
+                if src_mac and not is_noise_mac(src_mac):
+                    src_stats.unicast_source_frames += 1
+                    src_stats.macs.add(src_mac)
+                if row.get("arp.src.proto_ipv4") and protocol == "ARP" and arp_opcode == "2":
+                    src_stats.arp_replies += 1
+                if syn and not ack and is_ip(dst_ip):
+                    src_stats.scanned_targets.add(dst_ip)
+                    src_stats.tcp_syn_sent.add(dst_port)
+                if syn and ack and src_port:
+                    src_stats.tcp_synack_ports.add(src_port)
+                if rst and src_port:
+                    src_stats.tcp_rst_ports.add(src_port)
+                for udp_src_port in udp_src_ports:
+                    if udp_src_port in {"53", "67", "68", "123", "1900", "5353", "5355", "137"} or service_names:
+                        src_stats.udp_response_ports.add(udp_src_port)
+                if protocol == "DNS":
+                    src_stats.dns_queries.update(dns_queries)
+                    src_stats.hostnames.update(name for name in dns_answers if name and not is_ip(name))
+                    src_stats.services.update(service_names)
+                src_stats.dns_queries.update(http_values)
+                src_stats.dns_queries.update(tls_sni)
+                src_stats.hostnames.update(dhcp_hostnames)
+                src_stats.dhcp_servers.update(dhcp_servers)
+                src_stats.dhcp_routers.update(dhcp_routers)
+                src_stats.dhcp_dns_servers.update(dhcp_dns_servers)
+                src_stats.dhcp_subnet_masks.update(dhcp_subnet_masks)
+                src_stats.dhcp_requested_ips.update(dhcp_requested_ips)
+                for value in row_values(row, "dhcp.option.vendor_class_id", "bootp.option.vendor_class_id", "dhcp.option.user_class", "bootp.option.user_class"):
+                    src_stats.dhcp_vendor_classes.add(value)
+                for value in row_values(row, "dhcp.option.request_list_item", "bootp.option.request_list_item", "bootp.option.parameter_request_list"):
+                    src_stats.dhcp_parameter_lists.add(value)
+                src_stats.http_user_agents.update(row_values(row, "http.user_agent"))
+                src_stats.http_servers.update(row_values(row, "http.server"))
+                src_stats.tls_sni.update(tls_sni)
+                src_stats.tls_ja3.update(row_values(row, "tls.handshake.ja3"))
+                if row.get("http.server") and src_port:
+                    src_stats.tcp_synack_ports.add(src_port)
+
+            if is_ip(dst_ip):
+                dst_stats = stats(dst_ip)
+                dst_stats.destination_frames += 1
+                dst_stats.merge_frame(frame)
+                if protocol:
+                    dst_stats.protocols[protocol] += 1
+                if dst_mac and not is_noise_mac(dst_mac):
+                    dst_stats.macs.add(dst_mac)
+                if protocol == "ARP" and arp_opcode == "1":
+                    dst_stats.arp_requests_for += 1
+                if syn and not ack and is_ip(src_ip):
+                    dst_stats.scanned_by.add(src_ip)
+                if assigned_ip and dst_ip == assigned_ip:
+                    dst_stats.dhcp_leases.add(assigned_ip)
+                    dst_stats.hostnames.update(dhcp_hostnames)
+                    if dhcp_client_mac and not is_noise_mac(dhcp_client_mac):
+                        dst_stats.macs.add(dhcp_client_mac)
+                dst_stats.http_servers.update(row_values(row, "http.server"))
+                dst_stats.tls_sni.update(tls_sni)
+                dst_stats.tls_ja3.update(row_values(row, "tls.handshake.ja3"))
+
+            for option_ip in dhcp_servers:
+                option_stats = stats(option_ip)
+                option_stats.dhcp_leases.update(ip for ip in [assigned_ip, src_ip, dst_ip] if is_ip(ip) and ip != option_ip)
+                option_stats.protocols["DHCP"] += 1
+            for option_ip in dhcp_routers:
+                option_stats = stats(option_ip)
+                option_stats.dhcp_routers.update(ip for ip in [assigned_ip, src_ip, dst_ip] if is_ip(ip) and ip != option_ip)
+                option_stats.protocols["DHCP"] += 1
+            for option_ip in dhcp_dns_servers:
+                option_stats = stats(option_ip)
+                option_stats.dhcp_dns_servers.update(ip for ip in [assigned_ip, src_ip, dst_ip] if is_ip(ip) and ip != option_ip)
+                option_stats.protocols["DHCP"] += 1
+            for answer_ip in dns_answer_ips:
+                answer_stats = stats(answer_ip)
+                answer_stats.hostnames.update(dns_answers)
+                answer_stats.protocols["DNS"] += 1
+
+            if is_ip(src_ip) and is_ip(dst_ip):
+                if self._is_meaningful_peer(src_ip, dst_ip, protocol, syn, ack, rst):
+                    stats(src_ip).peers[dst_ip] += 1
+                    stats(dst_ip).peers[src_ip] += 1
+                    conversation_counter[(src_ip, dst_ip, src_mac if is_mac(src_mac) else "", dst_mac if is_mac(dst_mac) else "", protocol, src_port, dst_port)] += 1
+
+        self._emit_ip_candidates(stats_by_ip)
+        self._emit_ip_conversations(conversation_counter, stats_by_ip)
+        self._emit_scan_rows(stats_by_ip)
+        self._emit_service_rows(stats_by_ip)
+
+    def _is_meaningful_peer(self, src_ip: str, dst_ip: str, protocol: str, syn: bool, ack: bool, rst: bool) -> bool:
+        if ip_scope(dst_ip) in {"multicast", "special"} or ip_scope(src_ip) in {"multicast", "special"}:
+            return False
+        if syn and not ack and not rst:
+            return False
+        return bool(protocol)
+
+    def _ip_evidence_level(self, host: IPHostStats) -> str:
+        scope = ip_scope(host.ip)
+        if scope in {"multicast", "special", "loopback"} or host.ip.endswith(".0") or host.ip == "255.255.255.255":
+            return "Special"
+        if scope == "external/global":
+            return "External"
+        if host.arp_replies or host.tcp_synack_ports or host.hostnames or host.unicast_source_frames or host.dhcp_routers or host.dhcp_dns_servers or host.dhcp_leases:
+            return "Confirmed"
+        if host.source_frames >= 2 or host.macs:
+            return "Probable"
+        if host.scanned_by and not host.source_frames:
+            return "Probed"
+        return "Weak"
+
+    def _emit_ip_candidates(self, stats_by_ip: dict[str, IPHostStats]) -> None:
+        for host in stats_by_ip.values():
+            level = self._ip_evidence_level(host)
+            if level in {"Probed", "Weak", "Special"} and host.ip != self.ip:
+                continue
+            labels = ["ip-device", level.lower()]
+            related = sorted(host.macs)[:3]
+            if self.ip and host.ip == self.ip:
+                related.append("user-input")
+            candidate = self.result.add_candidate(
+                "IP",
+                host.ip,
+                Evidence("IP host classification", f"{level} IP host based on aggregated traffic evidence.", self._ip_score(host, level), {"ip": host.ip, "level": level}),
+                labels=labels,
+                related=related,
+            )
+            profile = self._profile("IP", candidate.value)
+            profile.merge_frame(host.first_frame)
+            profile.first_seen = host.first_frame or profile.first_seen
+            profile.last_seen = host.last_frame or profile.last_seen
+            profile.frame_count = max(profile.frame_count, host.total_frames)
+            profile.ips.add(host.ip)
+            profile.role_hints.add(level)
+            profile.role_hints.add(ip_scope(host.ip))
+            profile.protocols.update(host.protocols.keys())
+            profile.hostnames.update(host.hostnames)
+            profile.dns_queries.update(host.dns_queries)
+            profile.services.update(host.services)
+            profile.dhcp_vendor_classes.update(host.dhcp_vendor_classes)
+            profile.dhcp_parameter_lists.update(host.dhcp_parameter_lists)
+            profile.dhcp_servers.update(host.dhcp_servers)
+            profile.dhcp_routers.update(host.dhcp_routers)
+            profile.dhcp_dns_servers.update(host.dhcp_dns_servers)
+            profile.dhcp_subnet_masks.update(host.dhcp_subnet_masks)
+            profile.dhcp_requested_ips.update(host.dhcp_requested_ips)
+            profile.dhcp_requested_ips.update(host.dhcp_leases)
+            profile.http_user_agents.update(host.http_user_agents)
+            profile.http_servers.update(host.http_servers)
+            profile.tls_sni.update(host.tls_sni)
+            profile.tls_ja3.update(host.tls_ja3)
+            profile.peers.update(peer for peer, _ in host.peers.most_common(20))
+            if host.macs:
+                mac = sorted(host.macs)[0]
+                profile.mac = profile.mac or mac
+                profile.vendor = profile.vendor or oui_prefix(mac)
+                if is_local_admin_mac(mac):
+                    profile.warnings.add("Linked MAC is locally administered; it may be randomized")
+                for mac_profile in self._profiles_for_mac(mac):
+                    mac_profile.ips.add(host.ip)
+                    mac_profile.protocols.update(host.protocols.keys())
+                    mac_profile.hostnames.update(host.hostnames)
+                    mac_profile.services.update(host.services)
+                    mac_profile.dhcp_vendor_classes.update(host.dhcp_vendor_classes)
+                    mac_profile.dhcp_parameter_lists.update(host.dhcp_parameter_lists)
+                    mac_profile.dhcp_servers.update(host.dhcp_servers)
+                    mac_profile.dhcp_routers.update(host.dhcp_routers)
+                    mac_profile.dhcp_dns_servers.update(host.dhcp_dns_servers)
+                    mac_profile.dhcp_subnet_masks.update(host.dhcp_subnet_masks)
+                    mac_profile.dhcp_requested_ips.update(host.dhcp_requested_ips)
+                    mac_profile.dhcp_requested_ips.update(host.dhcp_leases)
+                    mac_profile.http_user_agents.update(host.http_user_agents)
+                    mac_profile.http_servers.update(host.http_servers)
+                    mac_profile.tls_sni.update(host.tls_sni)
+                    mac_profile.tls_ja3.update(host.tls_ja3)
+            if host.tcp_synack_ports:
+                profile.services.update(f"{port}/tcp open" for port in sorted(host.tcp_synack_ports, key=self._sort_number_text))
+                profile.role_hints.add("TCP service responder")
+            if host.tcp_rst_ports:
+                profile.services.update(f"{port}/tcp closed" for port in sorted(host.tcp_rst_ports, key=self._sort_number_text)[:20])
+            if host.udp_response_ports:
+                profile.services.update(f"{port}/udp response" for port in sorted(host.udp_response_ports, key=self._sort_number_text))
+            self._add_ip_role_hints(profile, host)
+            for hostname in host.hostnames:
+                self.result.add_candidate(
+                    "Hostname",
+                    hostname,
+                    Evidence("Hostname observation", f"Hostname was observed for IP {host.ip}.", 20, {"ip": host.ip, "hostname": hostname}),
+                    labels=["hostname"],
+                    related=[host.ip, profile.mac],
+                )
+
+    def _ip_score(self, host: IPHostStats, level: str) -> int:
+        scores = {"Confirmed": 90, "Probable": 55, "External": 25, "Special": 10, "Probed": 5, "Weak": 10}
+        score = scores.get(level, 10)
+        if host.tcp_synack_ports:
+            score += min(25, 10 + len(host.tcp_synack_ports) * 3)
+        if host.hostnames:
+            score += 20
+        if host.arp_replies:
+            score += 20
+        if host.dhcp_routers or host.dhcp_dns_servers or host.dhcp_leases:
+            score += 20
+        return min(score, 160)
+
+    def _add_ip_role_hints(self, profile: DeviceProfile, host: IPHostStats) -> None:
+        ports = set(host.tcp_synack_ports)
+        if "53" in ports or "DNS" in host.protocols:
+            profile.role_hints.add("DNS server/responder")
+        if {"67", "547"} & ports or "DHCP" in " ".join(host.protocols.keys()).upper():
+            profile.role_hints.add("DHCP participant")
+        if host.dhcp_leases:
+            profile.role_hints.add("DHCP server")
+        if host.dhcp_routers:
+            profile.role_hints.add("router/gateway from DHCP option")
+        if host.dhcp_dns_servers:
+            profile.role_hints.add("DNS server from DHCP option")
+        if {"80", "8080", "443"} & ports:
+            profile.role_hints.add("web service")
+        if {"445", "139"} & ports:
+            profile.role_hints.add("Windows/SMB service")
+        if len(host.peers) >= 5 and ip_scope(host.ip) == "local/private":
+            profile.role_hints.add("central local host or gateway candidate")
+        if len(host.scanned_targets) >= 20:
+            profile.role_hints.add("scanner")
+
+    def _emit_ip_conversations(self, conversation_counter: Counter, stats_by_ip: dict[str, IPHostStats]) -> None:
+        for (src_ip, dst_ip, src_mac, dst_mac, protocol, src_port, dst_port), count in conversation_counter.most_common(500):
+            if not self._conversation_should_show(src_ip, dst_ip, stats_by_ip):
+                continue
+            self.result.conversation_rows.append(
+                {
+                    "Source IP": src_ip,
+                    "Destination IP": dst_ip,
+                    "Source MAC": src_mac,
+                    "Destination MAC": dst_mac,
+                    "Protocol": protocol,
+                    "Source Port": src_port,
+                    "Destination Port": dst_port,
+                    "Frames": str(count),
+                }
+            )
+
+    def _conversation_should_show(self, src_ip: str, dst_ip: str, stats_by_ip: dict[str, IPHostStats]) -> bool:
+        src_level = self._ip_evidence_level(stats_by_ip.get(src_ip, IPHostStats(src_ip)))
+        dst_level = self._ip_evidence_level(stats_by_ip.get(dst_ip, IPHostStats(dst_ip)))
+        if "Special" in {src_level, dst_level}:
+            return False
+        return src_level in {"Confirmed", "Probable", "External"} or dst_level in {"Confirmed", "Probable", "External"}
+
+    def _emit_scan_rows(self, stats_by_ip: dict[str, IPHostStats]) -> None:
+        for host in stats_by_ip.values():
+            if len(host.scanned_targets) < 10:
+                continue
+            responsive = [target for target in host.scanned_targets if stats_by_ip.get(target) and self._ip_evidence_level(stats_by_ip[target]) in {"Confirmed", "Probable"}]
+            self.result.scan_rows.append(
+                {
+                    "Scanner": host.ip,
+                    "Targets": str(len(host.scanned_targets)),
+                    "Responsive": str(len(responsive)),
+                    "Target Sample": ", ".join(sorted(host.scanned_targets, key=self._sort_number_text)[:12]),
+                    "Open Ports Seen": ", ".join(sorted({port for target in responsive for port in stats_by_ip[target].tcp_synack_ports}, key=self._sort_number_text)),
+                }
+            )
+
+    def _emit_service_rows(self, stats_by_ip: dict[str, IPHostStats]) -> None:
+        for host in stats_by_ip.values():
+            level = self._ip_evidence_level(host)
+            if level not in {"Confirmed", "Probable", "External"}:
+                continue
+            for port in sorted(host.tcp_synack_ports, key=self._sort_number_text):
+                row = {"IP": host.ip, "Port": port, "Proto": "tcp", "State": "open", "Service Hint": self._service_hint(port, "tcp")}
+                self.result.service_rows.append(row)
+                self.result.open_service_rows.append(row)
+            for port in sorted(host.tcp_rst_ports, key=self._sort_number_text)[:20]:
+                row = {"IP": host.ip, "Port": port, "Proto": "tcp", "State": "closed", "Service Hint": self._service_hint(port, "tcp")}
+                self.result.service_rows.append(row)
+                self.result.closed_service_rows.append(row)
+            for port in sorted(host.udp_response_ports, key=self._sort_number_text):
+                row = {"IP": host.ip, "Port": port, "Proto": "udp", "State": "response", "Service Hint": self._service_hint(port, "udp")}
+                self.result.service_rows.append(row)
+                self.result.open_service_rows.append(row)
+            for service in sorted(host.services)[:20]:
+                row = {"IP": host.ip, "Port": "", "Proto": "discovery", "State": "advertised", "Service Hint": service}
+                self.result.service_rows.append(row)
+                self.result.closed_service_rows.append(row)
+
+    def _service_hint(self, port: str, proto: str) -> str:
+        names = {
+            ("22", "tcp"): "SSH",
+            ("53", "tcp"): "DNS",
+            ("53", "udp"): "DNS",
+            ("67", "udp"): "DHCP server",
+            ("68", "udp"): "DHCP client",
+            ("80", "tcp"): "HTTP",
+            ("137", "udp"): "NetBIOS name",
+            ("139", "tcp"): "NetBIOS",
+            ("443", "tcp"): "HTTPS",
+            ("445", "tcp"): "SMB",
+            ("515", "tcp"): "LPD printer",
+            ("554", "tcp"): "RTSP",
+            ("631", "tcp"): "IPP printer",
+            ("1900", "udp"): "SSDP",
+            ("5000", "tcp"): "UPnP/web service",
+            ("5060", "tcp"): "SIP",
+            ("5060", "udp"): "SIP",
+            ("5061", "tcp"): "SIP TLS",
+            ("5353", "udp"): "mDNS",
+            ("5355", "udp"): "LLMNR",
+            ("3389", "tcp"): "RDP",
+            ("8008", "tcp"): "Chromecast HTTP",
+            ("8009", "tcp"): "Chromecast control",
+            ("8080", "tcp"): "HTTP alt",
+            ("8443", "tcp"): "HTTPS alt",
+            ("9100", "tcp"): "JetDirect printer",
+        }
+        return names.get((port, proto), "")
+
+    def _summarize_ip_devices(self) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for candidate in self.result.sorted_candidates():
+            if candidate.kind != "IP":
+                continue
+            profile = self.result.profile_for(candidate)
+            level = next((label.title() for label in candidate.labels if label in {"confirmed", "probable", "probed", "external", "special", "weak"}), "")
+            rows.append(
+                {
+                    "IP": candidate.value,
+                    "Evidence": level,
+                    "Scope": ip_scope(candidate.value),
+                    "MAC": profile.mac,
+                    "Hostnames": ", ".join(sorted(profile.hostnames)),
+                    "Role Hints": ", ".join(sorted(hint for hint in profile.role_hints if hint)),
+                    "DHCP Server": ", ".join(sorted(profile.dhcp_servers, key=str)),
+                    "Router": ", ".join(sorted(profile.dhcp_routers, key=str)),
+                    "DNS Servers": ", ".join(sorted(profile.dhcp_dns_servers, key=str)),
+                    "Open TCP": ", ".join(sorted((item.split("/", 1)[0] for item in profile.services if "/tcp open" in item), key=self._sort_number_text)),
+                    "Protocols": ", ".join(sorted(profile.protocols)),
+                    "Peers": str(len(profile.peers)),
+                    "DNS Queries": str(len(profile.dns_queries)),
+                    "First Frame": profile.first_seen,
+                    "Last Frame": profile.last_seen,
+                    "Sightings": str(profile.frame_count),
+                }
+            )
+        return rows
 
 
 def render_candidate_detail(candidate: Candidate | None) -> str:
@@ -1001,12 +1927,39 @@ def render_device_profile(candidate: Candidate | None, result: AnalysisResult | 
         f"{candidate.kind}: {candidate.value}",
         f"Confidence: {confidence_badge(candidate.confidence)} ({candidate.confidence})",
         "",
+        "Inferred Device Types",
+    ]
+    top_types = [
+        (dtype, score, profile.device_type_evidence.get(dtype, []))
+        for dtype, score in sorted(profile.device_type_scores.items(), key=lambda item: (-item[1], item[0]))[:10]
+    ]
+    if top_types:
+        for index, (dtype, score, evidence) in enumerate(top_types, 1):
+            lines.append(f"{index}. {dtype}: {score}%")
+            for clue in evidence[:3]:
+                lines.append(f"   - {clue}")
+    else:
+        lines.append("- Not enough device-specific evidence.")
+    lines.extend([
+        "",
         "Identity",
         f"- Role: {profile.role or candidate.kind}",
         f"- MAC: {profile.mac or (candidate.value if is_mac(candidate.value) else '-')}",
+        f"- IP(s): {', '.join(sorted(profile.ips)) or (candidate.value if candidate.kind == 'IP' else '-')}",
+        f"- Hostname(s): {', '.join(sorted(profile.hostnames)) or '-'}",
         f"- OUI vendor/prefix: {profile.vendor or '-'}",
+        f"- DHCP vendor/user class: {', '.join(sorted(profile.dhcp_vendor_classes)) or '-'}",
+        f"- DHCP parameter list(s): {', '.join(sorted(profile.dhcp_parameter_lists)) or '-'}",
         f"- SSID(s): {', '.join(sorted(profile.ssids)) or '-'}",
         f"- BSSID(s): {', '.join(sorted(profile.bssids)) or '-'}",
+        f"- Role hints: {', '.join(sorted(hint for hint in profile.role_hints if hint)) or '-'}",
+        "",
+        "Network Configuration",
+        f"- DHCP server(s): {', '.join(sorted(profile.dhcp_servers, key=str)) or '-'}",
+        f"- Router/gateway option(s): {', '.join(sorted(profile.dhcp_routers, key=str)) or '-'}",
+        f"- DNS server option(s): {', '.join(sorted(profile.dhcp_dns_servers, key=str)) or '-'}",
+        f"- Subnet mask(s): {', '.join(sorted(profile.dhcp_subnet_masks)) or '-'}",
+        f"- Requested/leased IP(s): {', '.join(sorted(profile.dhcp_requested_ips, key=str)) or '-'}",
         "",
         "Device",
         f"- Make: {profile.make or '-'}",
@@ -1034,7 +1987,14 @@ def render_device_profile(candidate: Candidate | None, result: AnalysisResult | 
         "Decrypted Traffic",
         f"- IPs: {', '.join(sorted(profile.ips)) or '-'}",
         f"- Protocols: {', '.join(sorted(profile.protocols)) or '-'}",
-    ]
+        f"- Peers: {', '.join(sorted(profile.peers)) or '-'}",
+        f"- DNS/name queries: {', '.join(sorted(profile.dns_queries)) or '-'}",
+        f"- HTTP user agents: {', '.join(sorted(profile.http_user_agents)) or '-'}",
+        f"- HTTP servers: {', '.join(sorted(profile.http_servers)) or '-'}",
+        f"- TLS SNI: {', '.join(sorted(profile.tls_sni)) or '-'}",
+        f"- TLS JA3: {', '.join(sorted(profile.tls_ja3)) or '-'}",
+        f"- Services: {', '.join(sorted(profile.services)) or '-'}",
+    ])
     warnings = set(profile.warnings)
     for item in missing:
         warnings.add(f"{item} unavailable in collected capture fields")
@@ -1056,6 +2016,12 @@ def render_device_graph(candidate: Candidate | None, result: AnalysisResult | No
                 lines.append(f"       -> {row.get('Role', 'Device')} {row.get('MAC', '')}")
     for ssid in sorted(profile.ssids):
         lines.append(f"  -> SSID {ssid}")
+    for ip in sorted(profile.ips):
+        lines.append(f"  -> IP {ip}")
+    for host in sorted(profile.hostnames):
+        lines.append(f"  -> Hostname {host}")
+    for peer in sorted(profile.peers):
+        lines.append(f"  -> Talks with {peer}")
     for item in related:
         if item and item not in profile.bssids and item not in profile.ssids:
             lines.append(f"  -> Related {item}")
@@ -1064,11 +2030,49 @@ def render_device_graph(candidate: Candidate | None, result: AnalysisResult | No
     return "\n".join(lines)
 
 
+def render_traffic_detail(candidate: Candidate | None, result: AnalysisResult | None) -> str:
+    if not candidate or not result:
+        return "Select a row to see traffic details."
+    profile = result.profiles.get(candidate.key, DeviceProfile(key=candidate.key, role=candidate.kind))
+    identifiers = set(profile.ips)
+    if candidate.kind == "IP":
+        identifiers.add(candidate.value)
+    conversations = [
+        row
+        for row in result.conversation_rows
+        if row.get("Source IP") in identifiers or row.get("Destination IP") in identifiers
+    ]
+    lines = [
+        f"{candidate.kind}: {candidate.value}",
+        "",
+        "Traffic Summary",
+        f"- Protocols: {', '.join(sorted(profile.protocols)) or '-'}",
+        f"- Peers: {', '.join(sorted(profile.peers)) or '-'}",
+        f"- DNS/name queries: {', '.join(sorted(profile.dns_queries)) or '-'}",
+        f"- Hostnames: {', '.join(sorted(profile.hostnames)) or '-'}",
+        f"- Role hints: {', '.join(sorted(hint for hint in profile.role_hints if hint)) or '-'}",
+        "",
+        "Conversations",
+    ]
+    if not conversations:
+        lines.append("- No IP conversations tied to this selection.")
+    else:
+        for row in conversations[:40]:
+            lines.append(
+                f"- {row.get('Frames', '0')} frames: {row.get('Source IP', '-')}:{row.get('Source Port', '')} -> "
+                f"{row.get('Destination IP', '-')}:{row.get('Destination Port', '')} {row.get('Protocol', '')}"
+            )
+        if len(conversations) > 40:
+            lines.append(f"- ... {len(conversations) - 40} more summarized conversations omitted from this view")
+    return "\n".join(lines)
+
+
 def run_cli(args: argparse.Namespace) -> int:
     result = APAnalyzer(
         file_path=args.file,
         ssid=args.ssid or "",
         mac=args.mac or "",
+        ip=args.ip or "",
         mac_role=args.mac_role,
         password=args.password or "",
         temporal_key=args.tk or "",
@@ -1091,9 +2095,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--file", "-f", default="", help="Capture file path")
     parser.add_argument("--ssid", default="", help="Known SSID or SSID fragment")
     parser.add_argument("--mac", default="", help="Known MAC/BSSID/client address")
+    parser.add_argument("--ip", default="", help="Known IPv4/IPv6 address")
     parser.add_argument("--mac-role", default="Unknown", choices=["Unknown", "BSSID", "Client", "Wired/Upstream", "MAC"])
     parser.add_argument("--password", default="", help="WPA password/PSK for decryption")
-    parser.add_argument("--tk", default="", help="Temporal key for decryption")
+    parser.add_argument("--tk", default="", help="Temporal key or GTK for decryption")
     parser.add_argument("--tshark", default="tshark", help="tshark executable path")
     parser.add_argument("--cli", action="store_true", help="Run once without the terminal GUI")
     parser.add_argument("--json", default="", help="Export JSON report path")
@@ -1109,7 +2114,7 @@ def main() -> int:
     try:
         from textual import on, work
         from textual.app import App, ComposeResult
-        from textual.containers import Horizontal, Vertical
+        from textual.containers import Horizontal, Vertical, VerticalScroll
         from textual.screen import ModalScreen
         from textual.widgets import Button, DataTable, DirectoryTree, Footer, Header, Input, Label, Select, Static, TabbedContent, TabPane
     except (ImportError, ModuleNotFoundError) as exc:
@@ -1205,9 +2210,12 @@ def main() -> int:
             width: 1fr;
             border: solid $accent;
         }
-        #evidence-detail, #profile-detail, #graph-detail {
-            padding: 1;
+        #evidence-scroll, #profile-scroll, #graph-scroll, #traffic-scroll {
+            height: 1fr;
             overflow-y: auto;
+        }
+        #evidence-detail, #profile-detail, #graph-detail, #traffic-detail {
+            padding: 1;
         }
         DataTable {
             height: 1fr;
@@ -1221,6 +2229,7 @@ def main() -> int:
             ("q", "quit", "Quit"),
             ("ctrl+r", "analyze", "Analyze"),
             ("ctrl+s", "export_report", "Export"),
+            ("ctrl+c", "copy_detail", "Copy Detail"),
         ]
 
         def __init__(self, initial_args: argparse.Namespace) -> None:
@@ -1229,6 +2238,8 @@ def main() -> int:
             self.current_result: AnalysisResult | None = None
             self.candidate_by_key: dict[str, Candidate] = {}
             self.sort_state: dict[str, tuple[str, bool]] = {}
+            self.selected_candidate: Candidate | None = None
+            self.selected_detail_text: str = ""
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -1244,11 +2255,14 @@ def main() -> int:
                         value=self.initial_args.mac_role,
                         id="mac-role",
                     )
+                    yield Input(value=self.initial_args.ip, placeholder="IPv4 / IPv6 address", id="ip")
                     yield Input(value=self.initial_args.password, placeholder="Password / PSK", password=True, id="password")
-                    yield Input(value=self.initial_args.tk, placeholder="Temporal key / TK", password=True, id="tk")
+                    yield Input(value=self.initial_args.tk, placeholder="Temporal key / GTK", password=True, id="tk")
                 with Horizontal(id="actions"):
                     yield Button("Analyze", id="analyze", variant="primary")
                     yield Button("Export Report", id="export")
+                    yield Button("Copy Detail", id="copy-detail")
+                    yield Button("Export Selected", id="export-selected")
                     yield Button("Clear", id="clear")
                     yield Select(
                         [
@@ -1262,6 +2276,18 @@ def main() -> int:
                         value="all",
                         id="ap-filter",
                     )
+                    yield Select(
+                        [
+                            ("Confirmed/probable local IPs", "local"),
+                            ("All IPs", "all"),
+                            ("Confirmed only", "confirmed"),
+                            ("Show probed targets", "probed"),
+                            ("External IPs", "external"),
+                            ("Special/broadcast", "special"),
+                        ],
+                        value="local",
+                        id="ip-filter",
+                    )
             with Horizontal(id="body"):
                 with TabbedContent(id="tabs"):
                     with TabPane("Candidates", id="candidates-tab"):
@@ -1274,6 +2300,18 @@ def main() -> int:
                         yield DataTable(id="ssid-groups")
                     with TabPane("Clients", id="clients-tab"):
                         yield DataTable(id="clients")
+                    with TabPane("IP Devices", id="ip-devices-tab"):
+                        yield DataTable(id="ip-devices")
+                    with TabPane("Conversations", id="conversations-tab"):
+                        yield DataTable(id="conversations")
+                    with TabPane("Scans", id="scans-tab"):
+                        yield DataTable(id="scans")
+                    with TabPane("Open Services", id="open-services-tab"):
+                        yield DataTable(id="open-services")
+                    with TabPane("Closed/Other Services", id="closed-services-tab"):
+                        yield DataTable(id="closed-services")
+                    with TabPane("Device Types", id="device-types-tab"):
+                        yield DataTable(id="device-types")
                     with TabPane("Security", id="security-tab"):
                         yield DataTable(id="security")
                     with TabPane("Handshakes", id="handshakes-tab"):
@@ -1284,11 +2322,17 @@ def main() -> int:
                         yield Static("No messages yet.", id="messages")
                 with TabbedContent(id="detail"):
                     with TabPane("Evidence", id="evidence-pane"):
-                        yield Static("Select a row to see why it was identified as related.", id="evidence-detail")
+                        with VerticalScroll(id="evidence-scroll"):
+                            yield Static("Select a row to see why it was identified as related.", id="evidence-detail")
                     with TabPane("Profile", id="profile-pane"):
-                        yield Static("Select a row to see device information.", id="profile-detail")
+                        with VerticalScroll(id="profile-scroll"):
+                            yield Static("Select a row to see device information.", id="profile-detail")
                     with TabPane("Graph", id="graph-pane"):
-                        yield Static("Select a row to see related identifiers.", id="graph-detail")
+                        with VerticalScroll(id="graph-scroll"):
+                            yield Static("Select a row to see related identifiers.", id="graph-detail")
+                    with TabPane("Traffic", id="traffic-pane"):
+                        with VerticalScroll(id="traffic-scroll"):
+                            yield Static("Select a row to see traffic details.", id="traffic-detail")
             yield Static("Ready. Enter whatever identifiers you have, then click Analyze.", id="status")
             yield Footer()
 
@@ -1302,8 +2346,14 @@ def main() -> int:
                 "ap-observations": ["BSSID", "SSID", "Channel", "HT Primary", "Frequency", "RSSI", "Manufacturer", "Model", "Device", "Why"],
                 "ssid-groups": ["SSID", "BSSIDs", "Bands", "Channels", "Best RSSI", "AP Count", "Ranks"],
                 "clients": ["BSSID", "MAC", "Role", "Why"],
+                "ip-devices": ["IP", "Evidence", "Scope", "MAC", "Hostnames", "Role Hints", "DHCP Server", "Router", "DNS Servers", "Open TCP", "Protocols", "Peers", "DNS Queries", "First Frame", "Last Frame", "Sightings"],
+                "conversations": ["Source IP", "Destination IP", "Source MAC", "Destination MAC", "Protocol", "Source Port", "Destination Port", "Frames"],
+                "scans": ["Scanner", "Targets", "Responsive", "Target Sample", "Open Ports Seen"],
+                "open-services": ["IP", "Port", "Proto", "State", "Service Hint"],
+                "closed-services": ["IP", "Port", "Proto", "State", "Service Hint"],
+                "device-types": ["Kind", "Value", "Best Guess", "Confidence", "Alternatives", "Top Evidence"],
                 "security": ["BSSID", "Pairwise Cipher", "AKM", "MFPR", "MFPC"],
-                "handshakes": ["Frame", "BSSID", "Source", "Destination", "EAPOL Msg", "PMKID", "Why"],
+                "handshakes": ["Frame", "BSSID", "Source", "Destination", "EAPOL Msg", "PMKID", "GTK", "Why"],
                 "decrypted": ["Frame", "Protocol", "BSSID", "Source MAC", "Destination MAC", "Source IP", "Destination IP"],
             }
             for table_id, columns in table_specs.items():
@@ -1333,6 +2383,7 @@ def main() -> int:
                 "file_path": self.query_one("#file", Input).value,
                 "ssid": self.query_one("#ssid", Input).value,
                 "mac": self.query_one("#mac", Input).value,
+                "ip": self.query_one("#ip", Input).value,
                 "mac_role": str(self.query_one("#mac-role", Select).value),
                 "password": self.query_one("#password", Input).value,
                 "temporal_key": self.query_one("#tk", Input).value,
@@ -1354,6 +2405,12 @@ def main() -> int:
             self._fill_rows("ap-observations", result.ap_observation_rows)
             self._fill_rows("ssid-groups", result.ssid_group_rows)
             self._fill_rows("clients", result.client_rows)
+            self._fill_rows("ip-devices", self._filtered_ip_rows(result.ip_device_rows))
+            self._fill_rows("conversations", result.conversation_rows)
+            self._fill_rows("scans", result.scan_rows)
+            self._fill_rows("open-services", result.open_service_rows)
+            self._fill_rows("closed-services", result.closed_service_rows)
+            self._fill_rows("device-types", result.device_type_rows)
             self._fill_rows("security", result.security_rows)
             self._fill_rows("handshakes", result.handshake_rows)
             self._fill_rows("decrypted", result.decrypted_rows)
@@ -1361,12 +2418,13 @@ def main() -> int:
             self.query_one("#status", Static).update(f"Done. {len(result.candidates)} identifiers found. Select any row for Evidence, Profile, and Graph.")
 
         def _clear_tables(self) -> None:
-            for table_id in ["candidates", "aps", "ap-observations", "ssid-groups", "clients", "security", "handshakes", "decrypted"]:
+            for table_id in ["candidates", "aps", "ap-observations", "ssid-groups", "clients", "ip-devices", "conversations", "scans", "open-services", "closed-services", "device-types", "security", "handshakes", "decrypted"]:
                 self.query_one(f"#{table_id}", DataTable).clear()
             self.query_one("#messages", Static).update("Working...")
             self.query_one("#evidence-detail", Static).update("Select a row to see why it was identified as related.")
             self.query_one("#profile-detail", Static).update("Select a row to see device information.")
             self.query_one("#graph-detail", Static).update("Select a row to see related identifiers.")
+            self.query_one("#traffic-detail", Static).update("Select a row to see traffic details.")
 
         def _fill_candidates(self, result: AnalysisResult) -> None:
             table = self.query_one("#candidates", DataTable)
@@ -1390,9 +2448,13 @@ def main() -> int:
                 table.add_row(*(row.get(column, "") for column in columns), key=f"{candidate_key}|{table_id}|{index}")
 
         def _candidate_key_from_row(self, row: dict[str, str]) -> str:
-            for kind, field_name in [("BSSID", "BSSID"), ("Client", "MAC"), ("Wired/Upstream", "MAC"), ("MAC", "Source MAC"), ("MAC", "Destination MAC"), ("SSID", "SSID")]:
+            if row.get("Kind") and row.get("Value"):
+                key = f"{row.get('Kind')}:{normalize_ip(row.get('Value', '')) if row.get('Kind') == 'IP' else normalize_mac(row.get('Value', '')) if row.get('Kind') in {'BSSID', 'Client', 'Wired/Upstream', 'MAC'} else row.get('Value')}"
+                if key in self.candidate_by_key:
+                    return key
+            for kind, field_name in [("BSSID", "BSSID"), ("Client", "MAC"), ("Wired/Upstream", "MAC"), ("MAC", "Source MAC"), ("MAC", "Destination MAC"), ("IP", "IP"), ("IP", "Source IP"), ("IP", "Destination IP"), ("IP", "Scanner"), ("SSID", "SSID")]:
                 value = row.get(field_name, "")
-                key = f"{kind}:{normalize_mac(value) if kind != 'SSID' else value}"
+                key = f"{kind}:{normalize_mac(value) if kind in {'BSSID', 'Client', 'Wired/Upstream', 'MAC'} else normalize_ip(value) if kind == 'IP' else value}"
                 if key in self.candidate_by_key:
                     return key
             bssids = [part.strip() for part in row.get("BSSIDs", "").split(",") if part.strip()]
@@ -1430,13 +2492,52 @@ def main() -> int:
             self._fill_rows("aps", self._filtered_ap_rows(self.current_result.ap_rows))
             self.query_one("#status", Static).update(f"AP filter: {self.query_one('#ap-filter', Select).value}")
 
+        def _filtered_ip_rows(self, rows: list[dict[str, str]]) -> list[dict[str, str]]:
+            mode = str(self.query_one("#ip-filter", Select).value)
+            filtered: list[dict[str, str]] = []
+            for row in rows:
+                evidence = row.get("Evidence", "")
+                scope = row.get("Scope", "")
+                if mode == "local" and not (evidence in {"Confirmed", "Probable"} and scope == "local/private"):
+                    continue
+                if mode == "confirmed" and evidence != "Confirmed":
+                    continue
+                if mode == "probed" and evidence != "Probed":
+                    continue
+                if mode == "external" and evidence != "External":
+                    continue
+                if mode == "special" and evidence != "Special":
+                    continue
+                filtered.append(row)
+            return filtered
+
+        @on(Select.Changed, "#ip-filter")
+        def ip_filter_changed(self) -> None:
+            if not self.current_result:
+                return
+            self._fill_rows("ip-devices", self._filtered_ip_rows(self.current_result.ip_device_rows))
+            self.query_one("#status", Static).update(f"IP filter: {self.query_one('#ip-filter', Select).value}")
+
         @on(DataTable.RowSelected)
         def row_selected(self, event: DataTable.RowSelected) -> None:
             key = str(event.row_key.value).split("|", 1)[0]
             candidate = self.candidate_by_key.get(key)
+            self.selected_candidate = candidate
             self.query_one("#evidence-detail", Static).update(render_candidate_detail(candidate))
             self.query_one("#profile-detail", Static).update(render_device_profile(candidate, self.current_result))
             self.query_one("#graph-detail", Static).update(render_device_graph(candidate, self.current_result))
+            self.query_one("#traffic-detail", Static).update(render_traffic_detail(candidate, self.current_result))
+            self.selected_detail_text = self._selected_detail_bundle(candidate)
+
+        def _selected_detail_bundle(self, candidate: Candidate | None) -> str:
+            return "\n\n".join(
+                [
+                    "Evidence\n" + render_candidate_detail(candidate),
+                    "Profile\n" + render_device_profile(candidate, self.current_result),
+                    "Graph\n" + render_device_graph(candidate, self.current_result),
+                    "Traffic\n" + render_traffic_detail(candidate, self.current_result),
+                ]
+            )
 
         @on(DataTable.HeaderSelected)
         def header_selected(self, event: DataTable.HeaderSelected) -> None:
@@ -1463,6 +2564,10 @@ def main() -> int:
                 "First Frame",
                 "Last Frame",
                 "AP Count",
+                "Frames",
+                "Targets",
+                "Responsive",
+                "Port",
             }
             rank_order = {"Primary": 0, "Related": 1, "Possible": 2, "Weak": 3}
 
@@ -1491,9 +2596,48 @@ def main() -> int:
             self.current_result.export_json(base.with_suffix(".json"))
             self.query_one("#status", Static).update(f"Exported {base.with_suffix('.txt').name} and {base.with_suffix('.json').name}")
 
+        @on(Button.Pressed, "#copy-detail")
+        def copy_detail_button(self) -> None:
+            self.action_copy_detail()
+
+        def action_copy_detail(self) -> None:
+            if not self.selected_detail_text:
+                self.query_one("#status", Static).update("Select a device or row before copying detail.")
+                return
+            path = Path.cwd() / "last_selected_device.txt"
+            path.write_text(self.selected_detail_text, encoding="utf-8")
+            copied = self._copy_to_clipboard(self.selected_detail_text)
+            suffix = "Copied to clipboard" if copied else "Clipboard tool unavailable"
+            self.query_one("#status", Static).update(f"{suffix}; wrote {path.name}")
+
+        def _copy_to_clipboard(self, text: str) -> bool:
+            commands = [["clip"]] if os.name == "nt" else [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+            for command in commands:
+                if shutil.which(command[0]):
+                    try:
+                        subprocess.run(command, input=text, text=True, check=True)
+                        return True
+                    except Exception:
+                        continue
+            return False
+
+        @on(Button.Pressed, "#export-selected")
+        def export_selected_button(self) -> None:
+            self.action_export_selected()
+
+        def action_export_selected(self) -> None:
+            if not self.selected_candidate or not self.selected_detail_text:
+                self.query_one("#status", Static).update("Select a device or row before exporting selected detail.")
+                return
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_value = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.selected_candidate.value)
+            path = Path.cwd() / f"selected_{self.selected_candidate.kind}_{safe_value}_{stamp}.txt"
+            path.write_text(self.selected_detail_text, encoding="utf-8")
+            self.query_one("#status", Static).update(f"Exported selected detail to {path.name}")
+
         @on(Button.Pressed, "#clear")
         def clear_button(self) -> None:
-            for input_id in ["ssid", "mac", "password", "tk"]:
+            for input_id in ["ssid", "mac", "ip", "password", "tk"]:
                 self.query_one(f"#{input_id}", Input).value = ""
             self._clear_tables()
             self.query_one("#status", Static).update("Inputs cleared.")
