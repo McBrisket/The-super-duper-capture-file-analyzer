@@ -9,6 +9,7 @@ candidate in the UI explains why it was considered related to the user input.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
 import os
@@ -22,11 +23,18 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import unquote
 
 
 MAC_RE = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 BAD_MAC_PREFIXES = ("ff:ff:ff:ff:ff:ff", "33:33:", "01:00:", "01:80:c2:")
 LOCAL_MULTICAST_IPS = ("224.", "239.", "255.255.255.255")
+ANALYSIS_LEVELS = {"basic", "moderate", "deep"}
+
+
+def normalize_analysis_level(value: str) -> str:
+    value = (value or "deep").strip().lower()
+    return value if value in ANALYSIS_LEVELS else "deep"
 
 
 def normalize_mac(value: str) -> str:
@@ -398,8 +406,28 @@ class DeviceProfile:
     dhcp_requested_ips: set[str] = field(default_factory=set)
     http_user_agents: set[str] = field(default_factory=set)
     http_servers: set[str] = field(default_factory=set)
+    http_auth_realms: set[str] = field(default_factory=set)
+    credential_indicators: set[str] = field(default_factory=set)
     tls_sni: set[str] = field(default_factory=set)
     tls_ja3: set[str] = field(default_factory=set)
+    discovery_protocols: set[str] = field(default_factory=set)
+    management_ips: set[str] = field(default_factory=set)
+    platform: str = ""
+    software: str = ""
+    serial: str = ""
+    port_ids: set[str] = field(default_factory=set)
+    interface_names: set[str] = field(default_factory=set)
+    vlans: set[str] = field(default_factory=set)
+    mesh_ids: set[str] = field(default_factory=set)
+    topology_roles: set[str] = field(default_factory=set)
+    mesh_peers: set[str] = field(default_factory=set)
+    hwmp_peers: set[str] = field(default_factory=set)
+    neighbor_bssids: set[str] = field(default_factory=set)
+    rnr_bssids: set[str] = field(default_factory=set)
+    wds_peers: set[str] = field(default_factory=set)
+    vendor_ap_names: set[str] = field(default_factory=set)
+    vendor_mesh_clues: set[str] = field(default_factory=set)
+    mobility_domains: set[str] = field(default_factory=set)
     device_type_scores: dict[str, int] = field(default_factory=dict)
     device_type_evidence: dict[str, list[str]] = field(default_factory=dict)
     role_hints: set[str] = field(default_factory=set)
@@ -494,6 +522,10 @@ class AnalysisResult:
     ap_rows: list[dict[str, str]] = field(default_factory=list)
     ap_observation_rows: list[dict[str, str]] = field(default_factory=list)
     ssid_group_rows: list[dict[str, str]] = field(default_factory=list)
+    topology_rows: list[dict[str, str]] = field(default_factory=list)
+    discovery_rows: list[dict[str, str]] = field(default_factory=list)
+    credential_rows: list[dict[str, str]] = field(default_factory=list)
+    http_uri_rows: list[dict[str, str]] = field(default_factory=list)
     client_rows: list[dict[str, str]] = field(default_factory=list)
     ip_device_rows: list[dict[str, str]] = field(default_factory=list)
     conversation_rows: list[dict[str, str]] = field(default_factory=list)
@@ -570,6 +602,10 @@ class AnalysisResult:
             "ap_rows": self.ap_rows,
             "ap_observation_rows": self.ap_observation_rows,
             "ssid_group_rows": self.ssid_group_rows,
+            "topology_rows": self.topology_rows,
+            "discovery_rows": self.discovery_rows,
+            "credential_rows": self.credential_rows,
+            "http_uri_rows": self.http_uri_rows,
             "client_rows": self.client_rows,
             "ip_device_rows": self.ip_device_rows,
             "conversation_rows": self.conversation_rows,
@@ -602,6 +638,10 @@ class AnalysisResult:
             ("AP rows", self.ap_rows),
             ("AP observations", self.ap_observation_rows),
             ("SSID groups", self.ssid_group_rows),
+            ("Topology rows", self.topology_rows),
+            ("Discovery rows", self.discovery_rows),
+            ("Credential rows", self.credential_rows),
+            ("HTTP URI rows", self.http_uri_rows),
             ("Client rows", self.client_rows),
             ("IP devices", self.ip_device_rows),
             ("Conversations", self.conversation_rows),
@@ -666,6 +706,7 @@ class TsharkRunner:
         occurrence: str = "f",
         aggregator: str = ",",
         quiet_missing: bool = False,
+        two_pass: bool = False,
     ) -> tuple[list[dict[str, str]], list[str]]:
         messages: list[str] = []
         valid_fields = self.valid_fields()
@@ -676,6 +717,8 @@ class TsharkRunner:
             if missing_fields and not quiet_missing:
                 messages.append(f"tshark does not expose these optional fields: {', '.join(missing_fields)}")
         command = [self.tshark_path, "-n", "-r", file_path]
+        if two_pass:
+            command.append("-2")
         command.extend(decrypt or [])
         command.extend(["-Y", display_filter, "-T", "fields", "-E", "separator=\t", "-E", f"occurrence={occurrence}"])
         if occurrence == "a" and aggregator:
@@ -707,6 +750,7 @@ class APAnalyzer:
         mac_role: str = "Unknown",
         password: str = "",
         temporal_key: str = "",
+        analysis_level: str = "deep",
         tshark_path: str = "tshark",
     ) -> None:
         self.file_path = str(Path(file_path).expanduser())
@@ -716,6 +760,7 @@ class APAnalyzer:
         self.mac_role = mac_role
         self.password = password
         self.temporal_key = temporal_key.strip()
+        self.analysis_level = normalize_analysis_level(analysis_level)
         self.extracted_gtks: set[str] = set()
         self.runner = TsharkRunner(tshark_path)
         self.result = AnalysisResult()
@@ -782,18 +827,26 @@ class APAnalyzer:
         has_ip = self.runner.has_field("ip.src") or self.runner.has_field("arp.src.proto_ipv4")
         capture_mode = "mixed wireless/IP" if has_wlan and has_ip else "wireless monitor-mode" if has_wlan else "Ethernet/IP" if has_ip else "unknown"
         self.result.messages.append(f"Capture capability detected: {capture_mode}.")
+        self.result.messages.append(f"Analysis level: {self.analysis_level.title()}.")
 
         if has_wlan:
             self._discover_aps()
             self._inspect_security_and_handshakes()
             self._classify_clients_and_upstream()
-            self._extract_gtks()
-            self._inspect_decrypted_traffic()
+            self._inspect_topology()
         else:
             self.result.messages.append("No wlan.bssid field found; skipping monitor-mode wireless AP/client analysis.")
-        if has_ip:
+
+        self._inspect_discovery_protocols()
+        if has_wlan and self.analysis_level == "deep":
+            self._extract_gtks()
+            self._inspect_decrypted_traffic()
+
+        if self.analysis_level in {"moderate", "deep"} and has_ip:
             self._inspect_ip_traffic()
-            decrypt = self._decrypt_options() if has_wlan else []
+            self._inspect_http_services()
+            self._inspect_http_credentials()
+            decrypt = self._decrypt_options() if has_wlan and self.analysis_level == "deep" else []
             if decrypt:
                 key_sources = []
                 if self.password and self.ssid:
@@ -804,11 +857,20 @@ class APAnalyzer:
                     key_sources.append(f"{len(self.extracted_gtks)} extracted GTK(s)")
                 self.result.messages.append(f"Running decrypted IP/name analysis using: {', '.join(key_sources)}.")
                 self._inspect_ip_traffic(decrypt=decrypt, source_label="decrypted")
+                self._inspect_http_services(decrypt=decrypt, source_label="decrypted")
+                self._inspect_http_credentials(decrypt=decrypt, source_label="decrypted")
         else:
-            self.result.messages.append("No IPv4/ARP fields found; skipping IP device analysis.")
+            if self.analysis_level == "basic":
+                self.result.messages.append("Basic analysis selected; skipping IP host, service, credential, and decryption analysis.")
+            else:
+                self.result.messages.append("No IPv4/ARP fields found; skipping IP device analysis.")
         self.result.ap_observation_rows = uniq_rows(self.result.ap_observation_rows)
         self.result.ap_rows = self._summarize_ap_rows()
         self.result.ssid_group_rows = self._build_ssid_groups()
+        self.result.topology_rows = uniq_rows(self.result.topology_rows)
+        self.result.discovery_rows = uniq_rows(self.result.discovery_rows)
+        self.result.credential_rows = uniq_rows(self.result.credential_rows)
+        self.result.http_uri_rows = uniq_rows(self.result.http_uri_rows)
         self.result.client_rows = uniq_rows(self.result.client_rows)
         self.result.ip_device_rows = self._summarize_ip_devices()
         self.result.conversation_rows = uniq_rows(self.result.conversation_rows)
@@ -955,12 +1017,19 @@ class APAnalyzer:
             profile.vendor,
             profile.make,
             profile.model,
+            profile.platform,
+            profile.software,
             profile.mac,
             " ".join(profile.hostnames),
             " ".join(profile.dns_queries),
             " ".join(profile.services),
+            " ".join(profile.discovery_protocols),
             " ".join(profile.protocols),
             " ".join(profile.role_hints),
+            " ".join(profile.topology_roles),
+            " ".join(profile.mesh_ids),
+            " ".join(profile.vendor_ap_names),
+            " ".join(profile.vendor_mesh_clues),
             " ".join(profile.dhcp_vendor_classes),
             " ".join(profile.dhcp_servers),
             " ".join(profile.dhcp_routers),
@@ -976,6 +1045,14 @@ class APAnalyzer:
 
         if candidate.kind == "BSSID" or "candidate-ap" in candidate.labels:
             self._add_device_type(profile, "Access point", 70, "Device is observed as a BSSID/AP candidate")
+        if profile.mesh_ids or any("mesh" in role.lower() for role in profile.topology_roles):
+            self._add_device_type(profile, "Mesh node using wireless backhaul", 65, "802.11s mesh or vendor mesh topology evidence")
+            self._add_device_type(profile, "Access point", 25, "Mesh topology evidence belongs to AP infrastructure")
+        if profile.wds_peers:
+            self._add_device_type(profile, "Mesh node with Ethernet backhaul", 25, "WDS/four-address backhaul relationship observed")
+            self._add_device_type(profile, "Wireless repeater", 35, "Four-address wireless distribution/backhaul clue")
+        if profile.neighbor_bssids or profile.rnr_bssids or profile.mobility_domains:
+            self._add_device_type(profile, "Access point", 35, "Neighbor report/RNR/mobility-domain AP ecosystem clue")
         if "wireless client" in profile.role_hints:
             for dtype in ["Laptop", "Smartphone", "Tablet"]:
                 self._add_device_type(profile, dtype, 18, "Wireless client behavior without stronger device-specific clues")
@@ -1026,6 +1103,9 @@ class APAnalyzer:
                 self._add_device_type(profile, "Laptop", 45, "Apple macOS clue")
         if any(x in text for x in ["android", "samsung", "pixel", "oneplus"]):
             self._add_device_type(profile, "Smartphone", 45, "Android/mobile vendor or hostname clue")
+        if profile.discovery_protocols and not profile.device_type_scores:
+            for dtype in ["Router", "Switch", "Access point"]:
+                self._add_device_type(profile, dtype, 20, "Passive discovery protocol advertised infrastructure identity")
         if "TCP service responder" in profile.role_hints and not profile.device_type_scores:
             self._add_device_type(profile, "Server", 25, "Responds with open TCP service but lacks device-specific clues")
         if "scanner" in profile.role_hints:
@@ -1317,6 +1397,378 @@ class APAnalyzer:
             bssid_profile = self._profile("BSSID", bssid)
             profile.ssids.update(bssid_profile.ssids)
             self._update_radio_profile(profile, row)
+
+    def _inspect_topology(self) -> None:
+        fields = [
+            "frame.number", "wlan.bssid", "wlan.sa", "wlan.da", "wlan.ta", "wlan.ra", "wlan.addr",
+            "wlan.fc.type_subtype", "wlan.fc.tods", "wlan.fc.fromds", "wlan.fc.ds",
+            "wlan.mesh.id", "wlan.mesh.config.cap.forwarding", "wlan.mesh.config.formation_info.num_peers",
+            "wlan.mesh.formation_info.connect_to_as", "wlan.mesh.formation_info.connect_to_mesh_gate",
+            "wlan.fixed.mesh_action", "wlan.fixed.mesh_addr4", "wlan.fixed.mesh_addr5", "wlan.fixed.mesh_addr6",
+            "wlan.fixed.mesh_ttl", "wlan.fixed.metric", "wlan.fixed.rreqid", "wlan.fixed.selfprot_action",
+            "wlan.fixed.category_code", "wlan.hwmp.orig_sta", "wlan.hwmp.targ_sta", "wlan.hwmp.metric",
+            "wlan.hwmp.hopcount", "wlan.hwmp.ttl", "wlan.peering.local_id", "wlan.peering.peer_id",
+            "wlan.peering.proto", "wlan.nreport.bssid", "wlan.nreport.channumber", "wlan.nreport.opeclass",
+            "wlan.nreport.bssid.info.mobilitydomain", "wlan.rnr.bssid", "wlan.rnr.channel_number",
+            "wlan.rnr.tbtt_info.bss_parameters.same_ssid", "wlan.rnr.tbtt_info.bss_parameters.multiple_bssid",
+            "wlan.rnr.tbtt_info.bss_parameters.colocated_ap", "wlan.mobility_domain.mdid",
+            "wlan.mobility_domain.ft_capab", "wlan.mobility_domain.ft_capab.ft_over_ds",
+            "wlan.extreme_mesh.ie.mesh_id", "wlan.extreme_mesh.ie.mp_id", "wlan.extreme_mesh.ie.root",
+            "wlan.extreme_mesh.ie.nh", "wlan.extreme_mesh.ie.htr", "wlan.extreme_mesh.ie.mtr",
+            "wlan.extreme_mesh.ie.services.root", "wlan.marvell.ie.cap", "wlan.marvell.ie.metric_id",
+            "wlan.marvell.ie.proto_id", "wlan.fixed.mrvl_mesh_action", "wlan.vs.aerohive.hostname",
+            "wlan.vs.alcatel.apname", "wlan.vs.arista.ap_name", "wlan.vs.aruba.ap_name",
+            "wlan.vs.cisco.apname_v2", "wlan.vs.extreme.ap_name", "wlan.vs.fortinet.system.ap_model",
+            "wlan.vs.fortinet.system.ap_name", "wlan.vs.fortinet.system.ap_serial", "wlan.vs.mist.apname",
+            "wlan.vs.ruckus.apname",
+        ]
+        rows, messages = self.runner.fields(self.file_path, "wlan", fields, occurrence="a", aggregator=",", quiet_missing=True)
+        self.result.messages.extend(messages)
+        seen_topology = False
+        for row in rows:
+            bssid = normalize_mac(row.get("wlan.bssid", ""))
+            sa = normalize_mac(row.get("wlan.sa", ""))
+            ta = normalize_mac(row.get("wlan.ta", ""))
+            ra = normalize_mac(row.get("wlan.ra", ""))
+            da = normalize_mac(row.get("wlan.da", ""))
+            device = bssid if is_mac(bssid) and not is_noise_mac(bssid) else next((mac for mac in [ta, sa, ra, da] if is_mac(mac) and not is_noise_mac(mac)), "")
+            if not device:
+                continue
+
+            mesh_ids = row_values(row, "wlan.mesh.id", "wlan.extreme_mesh.ie.mesh_id")
+            mesh_fields = row_values(
+                row,
+                "wlan.mesh.config.cap.forwarding", "wlan.mesh.config.formation_info.num_peers",
+                "wlan.mesh.formation_info.connect_to_as", "wlan.mesh.formation_info.connect_to_mesh_gate",
+                "wlan.fixed.mesh_action", "wlan.fixed.mesh_addr4", "wlan.fixed.mesh_addr5",
+                "wlan.fixed.mesh_addr6", "wlan.fixed.mesh_ttl", "wlan.fixed.rreqid",
+                "wlan.fixed.selfprot_action",
+            )
+            hwmp_peers = [normalize_mac(value) for value in row_values(row, "wlan.hwmp.orig_sta", "wlan.hwmp.targ_sta") if is_mac(normalize_mac(value))]
+            hwmp_values = row_values(row, "wlan.hwmp.metric", "wlan.hwmp.hopcount", "wlan.hwmp.ttl")
+            peering_values = row_values(row, "wlan.peering.local_id", "wlan.peering.peer_id", "wlan.peering.proto")
+            neighbor_bssids = [normalize_mac(value) for value in row_values(row, "wlan.nreport.bssid") if is_mac(normalize_mac(value))]
+            rnr_bssids = [normalize_mac(value) for value in row_values(row, "wlan.rnr.bssid") if is_mac(normalize_mac(value))]
+            mobility_domains = row_values(row, "wlan.mobility_domain.mdid", "wlan.nreport.bssid.info.mobilitydomain")
+            vendor_ap_names = row_values(
+                row,
+                "wlan.vs.aerohive.hostname", "wlan.vs.alcatel.apname", "wlan.vs.arista.ap_name",
+                "wlan.vs.aruba.ap_name", "wlan.vs.cisco.apname_v2", "wlan.vs.extreme.ap_name",
+                "wlan.vs.fortinet.system.ap_model", "wlan.vs.fortinet.system.ap_name",
+                "wlan.vs.fortinet.system.ap_serial", "wlan.vs.mist.apname", "wlan.vs.ruckus.apname",
+            )
+            vendor_mesh = row_values(
+                row,
+                "wlan.extreme_mesh.ie.mp_id", "wlan.extreme_mesh.ie.root", "wlan.extreme_mesh.ie.nh",
+                "wlan.extreme_mesh.ie.htr", "wlan.extreme_mesh.ie.mtr", "wlan.extreme_mesh.ie.services.root",
+                "wlan.marvell.ie.cap", "wlan.marvell.ie.metric_id", "wlan.marvell.ie.proto_id",
+                "wlan.fixed.mrvl_mesh_action",
+            )
+            tods = row.get("wlan.fc.tods", "") in {"1", "True", "true"}
+            fromds = row.get("wlan.fc.fromds", "") in {"1", "True", "true"}
+            ds_status = row.get("wlan.fc.ds", "")
+            wds_peers = [mac for mac in [ta, ra, sa, da] if is_mac(mac) and not is_noise_mac(mac) and mac != device]
+
+            if mesh_ids or mesh_fields or hwmp_peers or hwmp_values or peering_values:
+                seen_topology = True
+                self._record_topology_clue(
+                    device, "Confirmed 802.11s mesh", 70,
+                    "802.11s mesh, HWMP, or mesh peering fields were observed.",
+                    "Confirmed", row, sorted(set(mesh_ids + hwmp_peers + wds_peers)),
+                    mesh_ids=mesh_ids, mesh_peers=hwmp_peers, hwmp_peers=hwmp_peers,
+                    role_hint="802.11s mesh node",
+                )
+            if (tods and fromds) or ds_status in {"0x03", "3"}:
+                seen_topology = True
+                self._record_topology_clue(
+                    device, "Probable wireless backhaul/WDS", 40,
+                    "Four-address wireless distribution frame observed with both To DS and From DS set.",
+                    "Probable", row, wds_peers, wds_peers=wds_peers,
+                    role_hint="wireless backhaul or WDS participant",
+                )
+            if neighbor_bssids or rnr_bssids or mobility_domains:
+                seen_topology = True
+                self._record_topology_clue(
+                    device, "Managed roaming / multi-AP ecosystem", 25,
+                    "Neighbor report, reduced neighbor report, or mobility-domain fields reference related APs.",
+                    "Related", row, sorted(set(neighbor_bssids + rnr_bssids + mobility_domains)),
+                    neighbor_bssids=neighbor_bssids, rnr_bssids=rnr_bssids,
+                    mobility_domains=mobility_domains, role_hint="managed roaming AP",
+                )
+            if vendor_mesh or vendor_ap_names:
+                seen_topology = True
+                self._record_topology_clue(
+                    device, "Vendor topology clue", 30 if vendor_mesh else 15,
+                    "Vendor-specific AP name, model, serial, or mesh IE was observed.",
+                    "Vendor", row, sorted(set(vendor_ap_names + vendor_mesh + mesh_ids)),
+                    vendor_ap_names=vendor_ap_names, vendor_mesh_clues=vendor_mesh,
+                    mesh_ids=mesh_ids, role_hint="vendor-managed AP",
+                )
+        if seen_topology:
+            self.result.messages.append("Topology analysis found mesh, roaming, WDS, RNR, or vendor AP relationship clues.")
+
+    def _record_topology_clue(
+        self,
+        device: str,
+        clue_type: str,
+        score: int,
+        reason: str,
+        confidence: str,
+        row: dict[str, str],
+        related: Iterable[str] = (),
+        mesh_ids: Iterable[str] = (),
+        mesh_peers: Iterable[str] = (),
+        hwmp_peers: Iterable[str] = (),
+        neighbor_bssids: Iterable[str] = (),
+        rnr_bssids: Iterable[str] = (),
+        wds_peers: Iterable[str] = (),
+        vendor_ap_names: Iterable[str] = (),
+        vendor_mesh_clues: Iterable[str] = (),
+        mobility_domains: Iterable[str] = (),
+        role_hint: str = "",
+    ) -> None:
+        device = normalize_mac(device)
+        if not is_mac(device) or is_noise_mac(device):
+            return
+        key_kind = "BSSID" if f"BSSID:{device}" in self.result.candidates or normalize_mac(row.get("wlan.bssid", "")) == device else "MAC"
+        evidence_fields = {
+            "device": device,
+            "clue": clue_type,
+            "mesh_ids": ",".join(sorted(set(mesh_ids))),
+            "neighbors": ",".join(sorted(set(neighbor_bssids))),
+            "rnr": ",".join(sorted(set(rnr_bssids))),
+            "wds_peers": ",".join(sorted(set(wds_peers))),
+            "hwmp_peers": ",".join(sorted(set(hwmp_peers))),
+            "mobility_domains": ",".join(sorted(set(mobility_domains))),
+            "vendor": ",".join(sorted(set(vendor_ap_names) | set(vendor_mesh_clues))),
+        }
+        candidate = self.result.add_candidate(
+            key_kind,
+            device,
+            Evidence("Topology analysis", reason, score, evidence_fields),
+            labels=["topology", clue_type.lower().replace(" ", "-").replace("/", "-")],
+            related=list(related),
+        )
+        profile = self.result.profile_for(candidate)
+        profile.merge_frame(row.get("frame.number", ""))
+        profile.topology_roles.add(clue_type)
+        if role_hint:
+            profile.role_hints.add(role_hint)
+        profile.mesh_ids.update(mesh_ids)
+        profile.mesh_peers.update(mesh_peers)
+        profile.hwmp_peers.update(hwmp_peers)
+        profile.neighbor_bssids.update(neighbor_bssids)
+        profile.rnr_bssids.update(rnr_bssids)
+        profile.wds_peers.update(wds_peers)
+        profile.vendor_ap_names.update(vendor_ap_names)
+        profile.vendor_mesh_clues.update(vendor_mesh_clues)
+        profile.mobility_domains.update(mobility_domains)
+        if key_kind == "BSSID":
+            profile.bssids.add(device)
+        for mac in set(neighbor_bssids) | set(rnr_bssids) | set(wds_peers) | set(hwmp_peers):
+            if is_mac(mac) and not is_noise_mac(mac):
+                related_profile = self._profile("BSSID" if f"BSSID:{mac}" in self.result.candidates else "MAC", mac)
+                related_profile.topology_roles.add(f"Referenced by {device}")
+                related_profile.mesh_peers.add(device)
+        self._merge_topology_row(
+            {
+                "Confidence": confidence,
+                "Role Guess": clue_type,
+                "Device": device,
+                "Kind": key_kind,
+                "Mesh ID": ", ".join(sorted(set(mesh_ids))),
+                "Mesh Peers": ", ".join(sorted(set(mesh_peers) | set(hwmp_peers))),
+                "WDS Peers": ", ".join(sorted(set(wds_peers))),
+                "Neighbor BSSIDs": ", ".join(sorted(set(neighbor_bssids))),
+                "RNR BSSIDs": ", ".join(sorted(set(rnr_bssids))),
+                "Mobility Domain": ", ".join(sorted(set(mobility_domains))),
+                "Vendor/AP Name": ", ".join(sorted(set(vendor_ap_names) | set(vendor_mesh_clues))),
+                "First Frame": row.get("frame.number", ""),
+                "Last Frame": row.get("frame.number", ""),
+                "Sightings": "1",
+                "Why": reason,
+            }
+        )
+
+    def _merge_topology_row(self, new_row: dict[str, str]) -> None:
+        existing = next((row for row in self.result.topology_rows if row.get("Device") == new_row.get("Device")), None)
+        if not existing:
+            self.result.topology_rows.append(new_row)
+            return
+
+        def merge_values(column: str, separator: str = ", ") -> None:
+            values = split_multi(existing.get(column, ""))
+            for value in split_multi(new_row.get(column, "")):
+                if value and value not in values:
+                    values.append(value)
+            existing[column] = separator.join(sorted(values))
+
+        confidence_rank = {"Confirmed": 4, "Probable": 3, "Related": 2, "Vendor": 1}
+        if confidence_rank.get(new_row.get("Confidence", ""), 0) > confidence_rank.get(existing.get("Confidence", ""), 0):
+            existing["Confidence"] = new_row.get("Confidence", "")
+        existing["Kind"] = "BSSID" if "BSSID" in {existing.get("Kind"), new_row.get("Kind")} else existing.get("Kind", "") or new_row.get("Kind", "")
+        for column in ["Role Guess", "Mesh ID", "Mesh Peers", "WDS Peers", "Neighbor BSSIDs", "RNR BSSIDs", "Mobility Domain", "Vendor/AP Name"]:
+            merge_values(column)
+        if new_row.get("Why") and new_row.get("Why") not in existing.get("Why", ""):
+            existing["Why"] = " | ".join(part for part in [existing.get("Why", ""), new_row.get("Why", "")] if part)
+
+        first = self._min_frame(existing.get("First Frame", ""), new_row.get("First Frame", ""))
+        last = self._max_frame(existing.get("Last Frame", ""), new_row.get("Last Frame", ""))
+        existing["First Frame"] = first
+        existing["Last Frame"] = last
+        try:
+            existing["Sightings"] = str(int(existing.get("Sightings", "0") or "0") + 1)
+        except ValueError:
+            existing["Sightings"] = "1"
+
+    def _min_frame(self, left: str, right: str) -> str:
+        try:
+            if not left:
+                return right
+            if not right:
+                return left
+            return str(min(int(left), int(right)))
+        except ValueError:
+            return left or right
+
+    def _max_frame(self, left: str, right: str) -> str:
+        try:
+            if not left:
+                return right
+            if not right:
+                return left
+            return str(max(int(left), int(right)))
+        except ValueError:
+            return left or right
+
+    def _inspect_discovery_protocols(self) -> None:
+        fields = [
+            "frame.number", "eth.src", "wlan.sa", "ip.src",
+            "lldp.chassis.id.mac", "lldp.chassis.id.ip4", "lldp.tlv.system.name", "lldp.tlv.system.desc",
+            "lldp.mgn.addr.ip4", "lldp.mgn.addr.ip6", "lldp.port.id", "lldp.port.desc", "lldp.time_to_live",
+            "lldp.tlv.system_cap.router", "lldp.tlv.system_cap.bridge", "lldp.tlv.system_cap.wlan_access_pt",
+            "lldp.tlv.enable_system_cap.router", "lldp.tlv.enable_system_cap.bridge", "lldp.tlv.enable_system_cap.wlan_access_pt",
+            "cdp.deviceid", "cdp.system_name", "cdp.ttl", "cdp.nrgyz.ip_address", "cdp.nrgyz.ipv6_address",
+            "cdp.portid", "cdp.platform", "cdp.software_version", "cdp.model_number", "cdp.system_serial_number",
+            "cdp.native_vlan", "cdp.voice_vlan", "cdp.capabilities.router", "cdp.capabilities.switch",
+            "cdp.capabilities.voip_phone", "cdp.capabilities.igmp_capable",
+            "mndp.identity", "mndp.softwareid", "mndp.uptime", "mndp.version", "mndp.platform", "mndp.board",
+            "mndp.ipv4address", "mndp.ipv6address", "mndp.interfacename", "mndp.mac",
+        ]
+        rows, messages = self.runner.fields(self.file_path, "lldp || cdp || mndp", fields, occurrence="a", aggregator=",", quiet_missing=True)
+        self.result.messages.extend(messages)
+        if not rows:
+            return
+        for row in rows:
+            protocol = "LLDP" if field_present(row, "lldp.tlv.system.name", "lldp.tlv.system.desc", "lldp.mgn.addr.ip4") else "CDP" if field_present(row, "cdp.deviceid", "cdp.system_name", "cdp.portid") else "MNDP"
+            mac = normalize_mac(first_row_value(row, "mndp.mac", "lldp.chassis.id.mac", "eth.src", "wlan.sa"))
+            ip = normalize_ip(first_row_value(row, "mndp.ipv4address", "cdp.nrgyz.ip_address", "lldp.mgn.addr.ip4", "lldp.chassis.id.ip4", "ip.src"))
+            hostname = first_row_value(row, "mndp.identity", "cdp.deviceid", "cdp.system_name", "lldp.tlv.system.name")
+            platform = first_row_value(row, "mndp.platform", "mndp.board", "cdp.platform", "cdp.model_number")
+            software = first_row_value(row, "mndp.version", "mndp.softwareid", "cdp.software_version", "lldp.tlv.system.desc")
+            port = first_row_value(row, "mndp.interfacename", "cdp.portid", "lldp.port.id", "lldp.port.desc")
+            uptime_ttl = first_row_value(row, "mndp.uptime", "cdp.ttl", "lldp.time_to_live")
+            serial = first_row_value(row, "cdp.system_serial_number")
+            vlans = row_values(row, "cdp.native_vlan", "cdp.voice_vlan")
+            role_hints = self._discovery_role_hints(row, protocol, platform, software)
+            if not any([is_mac(mac), is_ip(ip), hostname]):
+                continue
+            candidate_kind = "MAC" if is_mac(mac) and not is_noise_mac(mac) else "IP" if is_ip(ip) else "Hostname"
+            candidate_value = mac if candidate_kind == "MAC" else ip if candidate_kind == "IP" else hostname
+            related = [item for item in [ip, hostname, mac] if item and item != candidate_value]
+            self.result.add_candidate(
+                candidate_kind,
+                candidate_value,
+                Evidence(f"{protocol} discovery", f"{protocol} advertised device identity and management details.", 35, {"protocol": protocol, "mac": mac, "ip": ip, "hostname": hostname, "platform": platform, "software": software, "port": port}),
+                labels=["discovery", protocol.lower()],
+                related=related,
+            )
+            profiles: list[DeviceProfile] = []
+            if is_mac(mac) and not is_noise_mac(mac):
+                profiles.append(self._profile("MAC", mac))
+            if is_ip(ip):
+                profiles.append(self._profile("IP", ip))
+            if hostname:
+                profiles.append(self._profile("Hostname", hostname))
+            for profile in profiles:
+                self._merge_discovery_profile(profile, protocol, row.get("frame.number", ""), mac, ip, hostname, platform, software, port, uptime_ttl, serial, vlans, role_hints)
+            self._merge_discovery_row(
+                {
+                    "Protocol": protocol,
+                    "MAC": mac if is_mac(mac) else "",
+                    "IP": ip if is_ip(ip) else "",
+                    "Hostname/ID": hostname,
+                    "Platform/Model": platform,
+                    "Software/Firmware": software,
+                    "Port/Interface": port,
+                    "Uptime/TTL": uptime_ttl,
+                    "Role Hints": ", ".join(sorted(role_hints)),
+                    "Sightings": "1",
+                    "First Frame": row.get("frame.number", ""),
+                    "Last Frame": row.get("frame.number", ""),
+                }
+            )
+        if self.result.discovery_rows:
+            self.result.messages.append(f"Discovery protocol analysis found {len(self.result.discovery_rows)} advertised device identities.")
+
+    def _discovery_role_hints(self, row: dict[str, str], protocol: str, platform: str, software: str) -> set[str]:
+        text = f"{protocol} {platform} {software}".lower()
+        hints: set[str] = {"passive discovery advertised device"}
+        if row.get("lldp.tlv.system_cap.router") in {"1", "True", "true"} or row.get("lldp.tlv.enable_system_cap.router") in {"1", "True", "true"} or row.get("cdp.capabilities.router") in {"1", "True", "true"}:
+            hints.add("router")
+        if row.get("lldp.tlv.system_cap.bridge") in {"1", "True", "true"} or row.get("lldp.tlv.enable_system_cap.bridge") in {"1", "True", "true"} or row.get("cdp.capabilities.switch") in {"1", "True", "true"}:
+            hints.add("switch/bridge")
+        if row.get("lldp.tlv.system_cap.wlan_access_pt") in {"1", "True", "true"} or row.get("lldp.tlv.enable_system_cap.wlan_access_pt") in {"1", "True", "true"}:
+            hints.add("access point")
+        if row.get("cdp.capabilities.voip_phone") in {"1", "True", "true"}:
+            hints.add("VoIP phone")
+        if "routeros" in text or "mikrotik" in text or protocol == "MNDP":
+            hints.add("MikroTik network device")
+        if any(word in text for word in ["ap", "access point", "cap ax", "wap"]):
+            hints.add("access point")
+        if any(word in text for word in ["switch", "bridge", "catalyst"]):
+            hints.add("switch/bridge")
+        if "router" in text:
+            hints.add("router")
+        return hints
+
+    def _merge_discovery_profile(self, profile: DeviceProfile, protocol: str, frame: str, mac: str, ip: str, hostname: str, platform: str, software: str, port: str, uptime_ttl: str, serial: str, vlans: Iterable[str], role_hints: Iterable[str]) -> None:
+        profile.merge_frame(frame)
+        profile.discovery_protocols.add(protocol)
+        if is_mac(mac) and not is_noise_mac(mac):
+            profile.mac = profile.mac or mac
+        if is_ip(ip):
+            profile.ips.add(ip)
+            profile.management_ips.add(ip)
+        if hostname:
+            profile.hostnames.add(hostname)
+        profile.set_if_empty("platform", platform)
+        profile.set_if_empty("model", platform)
+        profile.set_if_empty("software", software)
+        profile.set_if_empty("firmware", software)
+        profile.set_if_empty("serial", serial)
+        profile.set_if_empty("uptime", uptime_ttl)
+        if port:
+            profile.port_ids.add(port)
+            profile.interface_names.add(port)
+        profile.vlans.update(value for value in vlans if value)
+        profile.role_hints.update(hint for hint in role_hints if hint)
+
+    def _merge_discovery_row(self, new_row: dict[str, str]) -> None:
+        row_key = (new_row.get("Protocol", ""), new_row.get("MAC", ""), new_row.get("IP", ""), new_row.get("Hostname/ID", ""))
+        existing = next((row for row in self.result.discovery_rows if (row.get("Protocol", ""), row.get("MAC", ""), row.get("IP", ""), row.get("Hostname/ID", "")) == row_key), None)
+        if not existing:
+            self.result.discovery_rows.append(new_row)
+            return
+        for column in ["Platform/Model", "Software/Firmware", "Port/Interface", "Uptime/TTL", "Role Hints"]:
+            values = split_multi(existing.get(column, ""))
+            for value in split_multi(new_row.get(column, "")):
+                if value and value not in values:
+                    values.append(value)
+            existing[column] = ", ".join(sorted(values))
+        existing["First Frame"] = self._min_frame(existing.get("First Frame", ""), new_row.get("First Frame", ""))
+        existing["Last Frame"] = self._max_frame(existing.get("Last Frame", ""), new_row.get("Last Frame", ""))
+        existing["Sightings"] = str(int(existing.get("Sightings", "0") or "0") + 1)
 
     def _decrypt_options(self) -> list[str]:
         opts: list[str] = []
@@ -1816,6 +2268,238 @@ class APAnalyzer:
                 self.result.service_rows.append(row)
                 self.result.closed_service_rows.append(row)
 
+    def _inspect_http_services(self, decrypt: list[str] | None = None, source_label: str = "cleartext") -> None:
+        response_fields = ["frame.number", "ip.src", "tcp.srcport", "http.response.code", "http.request_in", "http.server"]
+        response_rows, messages = self.runner.fields(
+            self.file_path,
+            "http.response.code in {200 201 202 204 206 301 302 303 307 308} && http.request_in",
+            response_fields,
+            decrypt=decrypt,
+            occurrence="a",
+            aggregator=",",
+            quiet_missing=True,
+            two_pass=True,
+        )
+        self.result.messages.extend(messages)
+        request_frames: dict[str, list[dict[str, str]]] = {}
+        for row in response_rows:
+            code = first_row_value(row, "http.response.code")
+            if not self._http_code_confirms_open(code):
+                continue
+            for request_frame in row_values(row, "http.request_in"):
+                if request_frame.isdigit():
+                    request_frames.setdefault(request_frame, []).append(row)
+        if not request_frames:
+            return
+        frame_ids = sorted(request_frames, key=self._sort_number_text)
+        recorded_services: set[tuple[str, str, str]] = set()
+        uri_sample_counts: Counter[tuple[str, str, str]] = Counter()
+        for chunk_start in range(0, len(frame_ids), 80):
+            chunk = frame_ids[chunk_start : chunk_start + 80]
+            if len(chunk) == 1:
+                request_filter = f"frame.number == {chunk[0]}"
+            else:
+                request_filter = "frame.number in {" + " ".join(chunk) + "}"
+            request_fields = ["frame.number", "ip.src", "ip.dst", "tcp.dstport", "http.host", "http.request.uri", "http.request.full_uri"]
+            request_rows, request_messages = self.runner.fields(
+                self.file_path,
+                request_filter,
+                request_fields,
+                decrypt=decrypt,
+                occurrence="a",
+                aggregator=",",
+                quiet_missing=True,
+                two_pass=True,
+            )
+            self.result.messages.extend(request_messages)
+            for request in request_rows:
+                frame = request.get("frame.number", "")
+                server_ip = normalize_ip(request.get("ip.dst", ""))
+                server_port = first_row_value(request, "tcp.dstport")
+                host = first_row_value(request, "http.host")
+                uri = first_row_value(request, "http.request.full_uri", "http.request.uri")
+                response_code = first_row_value(request_frames.get(frame, [{}])[0], "http.response.code")
+                server_header = first_row_value(request_frames.get(frame, [{}])[0], "http.server")
+                service_key = (server_ip, server_port, source_label)
+                if not (is_ip(server_ip) and server_port):
+                    continue
+                if uri_sample_counts[service_key] < 20:
+                    uri_sample_counts[service_key] += 1
+                    self._record_http_uri_sample(server_ip, server_port, host, uri, response_code, frame, server_header, source_label)
+                if service_key not in recorded_services:
+                    recorded_services.add(service_key)
+                    self._record_http_service(server_ip, server_port, host, uri, response_code, frame, server_header, source_label)
+
+    def _record_http_service(self, server_ip: str, port: str, host: str, uri: str, response_code: str, frame: str, server_header: str, source_label: str) -> None:
+        hint_parts = ["HTTP"]
+        if response_code:
+            hint_parts.append(f"{response_code} response")
+        if server_header:
+            hint_parts.append(server_header)
+        service_hint = " - ".join(hint_parts)
+        row = {"IP": server_ip, "Port": port, "Proto": "tcp", "State": "open", "Service Hint": service_hint}
+        self._upsert_service_row(row, open_row=True)
+        candidate = self.result.add_candidate(
+            "IP",
+            server_ip,
+            Evidence("HTTP service correlation", f"HTTP {response_code or ''} response confirms port {port} is serving HTTP.", 25, {"ip": server_ip, "port": port, "response_code": response_code, "source": source_label}),
+            labels=["ip-device", "http-service", source_label],
+            related=[host],
+        )
+        profile = self.result.profile_for(candidate)
+        profile.ips.add(server_ip)
+        profile.protocols.add("HTTP")
+        profile.services.add(f"{port}/tcp open HTTP")
+        if host:
+            profile.hostnames.add(host)
+        if uri:
+            profile.dns_queries.add(uri)
+        if server_header:
+            profile.http_servers.add(server_header)
+        profile.role_hints.add("web service")
+
+    def _record_http_uri_sample(self, server_ip: str, port: str, host: str, uri: str, response_code: str, frame: str, server_header: str, source_label: str) -> None:
+        row = {
+            "IP": server_ip,
+            "Port": port,
+            "Host": host,
+            "Status": response_code,
+            "URI": uri,
+            "Server": server_header,
+            "Source": source_label,
+            "Frame": frame,
+        }
+        key = tuple(row.get(column, "") for column in ["IP", "Port", "Host", "Status", "URI", "Source"])
+        existing_keys = {
+            tuple(existing.get(column, "") for column in ["IP", "Port", "Host", "Status", "URI", "Source"])
+            for existing in self.result.http_uri_rows
+        }
+        if key not in existing_keys:
+            self.result.http_uri_rows.append(row)
+
+    def _http_code_confirms_open(self, code: str) -> bool:
+        try:
+            numeric = int(code)
+        except (TypeError, ValueError):
+            return False
+        return numeric in {200, 201, 202, 204, 206, 301, 302, 303, 307, 308}
+
+    def _upsert_service_row(self, row: dict[str, str], open_row: bool = False) -> None:
+        def same_service(existing: dict[str, str]) -> bool:
+            return all(existing.get(key) == row.get(key) for key in ["IP", "Port", "Proto", "State"])
+
+        updated = False
+        for table in [self.result.service_rows, self.result.open_service_rows if open_row else []]:
+            for existing in table:
+                if same_service(existing):
+                    new_hint = row.get("Service Hint", "")
+                    old_hint = existing.get("Service Hint", "")
+                    if new_hint and new_hint != old_hint:
+                        if old_hint and old_hint in new_hint:
+                            existing["Service Hint"] = new_hint
+                        elif new_hint not in old_hint:
+                            existing["Service Hint"] = " | ".join(part for part in [old_hint, new_hint] if part)
+                    updated = True
+        if not updated:
+            self.result.service_rows.append(dict(row))
+            if open_row:
+                self.result.open_service_rows.append(dict(row))
+
+    def _short_text(self, value: str, limit: int = 80) -> str:
+        value = value.strip()
+        return value if len(value) <= limit else value[: limit - 3] + "..."
+
+    def _inspect_http_credentials(self, decrypt: list[str] | None = None, source_label: str = "cleartext") -> None:
+        fields = [
+            "frame.number", "eth.src", "wlan.sa", "ip.src", "ip.dst", "http.host", "http.request.full_uri",
+            "http.cookie_pair", "http.authorization", "http.proxy_authorization", "http.authbasic", "http.www_authenticate",
+        ]
+        rows, messages = self.runner.fields(self.file_path, "http", fields, decrypt=decrypt, occurrence="a", aggregator=",", quiet_missing=True)
+        self.result.messages.extend(messages)
+        for row in rows:
+            src_ip = normalize_ip(row.get("ip.src", ""))
+            dst_ip = normalize_ip(row.get("ip.dst", ""))
+            src_mac = normalize_mac(row.get("eth.src") or row.get("wlan.sa", ""))
+            host = first_row_value(row, "http.host")
+            uri = first_row_value(row, "http.request.full_uri")
+            realms = row_values(row, "http.www_authenticate")
+            for realm in realms:
+                self._mark_http_auth_realm(src_ip, dst_ip, host, realm)
+            for field_name in ["http.authorization", "http.proxy_authorization", "http.cookie_pair", "http.authbasic"]:
+                for value in row_values(row, field_name):
+                    decoded_items = self._decode_http_credential_value(value, field_name)
+                    for item in decoded_items:
+                        self._record_http_credential(row, source_label, field_name, value, item, src_ip, dst_ip, src_mac, host, uri)
+        if self.result.credential_rows:
+            self.result.messages.append(f"HTTP credential analysis found {len(self.result.credential_rows)} sensitive credential indicator(s).")
+
+    def _mark_http_auth_realm(self, src_ip: str, dst_ip: str, host: str, realm: str) -> None:
+        for ip in [src_ip, dst_ip]:
+            if is_ip(ip):
+                profile = self._profile("IP", ip)
+                profile.http_auth_realms.add(realm)
+                if host:
+                    profile.dns_queries.add(host)
+
+    def _decode_http_credential_value(self, value: str, field_name: str) -> list[dict[str, str]]:
+        decoded = unquote(value or "")
+        outputs: list[dict[str, str]] = []
+        candidates: list[tuple[str, str]] = []
+        if field_name == "http.authbasic" and decoded:
+            candidates.append(("HTTP Basic", decoded))
+        for match in re.finditer(r"(?i)\bBasic\s+([A-Za-z0-9+/=_-]+)", decoded):
+            candidates.append(("HTTP Basic", match.group(1)))
+        for kind, token in candidates:
+            token = token.strip().rstrip(",;")
+            credential = token
+            if ":" not in credential:
+                try:
+                    credential = base64.b64decode(token + "=" * (-len(token) % 4), validate=False).decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+            if ":" not in credential:
+                continue
+            username, secret = credential.split(":", 1)
+            if not username or not secret:
+                continue
+            outputs.append({"type": kind, "username": username, "secret": secret})
+        return outputs
+
+    def _record_http_credential(self, row: dict[str, str], source_label: str, field_name: str, raw_value: str, item: dict[str, str], src_ip: str, dst_ip: str, src_mac: str, host: str, uri: str) -> None:
+        candidate_value = src_ip if is_ip(src_ip) else src_mac if is_mac(src_mac) else host
+        candidate_kind = "IP" if is_ip(candidate_value) else "MAC" if is_mac(candidate_value) else "Hostname"
+        if not candidate_value:
+            return
+        reason = f"Sensitive HTTP credential material was observed in {field_name}; value was URL-decoded and Basic auth was base64-decoded."
+        self.result.add_candidate(
+            candidate_kind,
+            candidate_value,
+            Evidence("HTTP credential indicator", reason, 30, {"frame": row.get("frame.number", ""), "field": field_name, "host": host, "dst_ip": dst_ip, "username": item.get("username", "")}),
+            labels=["http-credential", source_label],
+            related=[dst_ip, host, src_mac],
+        )
+        for kind, value in [("IP", src_ip), ("IP", dst_ip), ("MAC", src_mac)]:
+            if (kind == "IP" and is_ip(value)) or (kind == "MAC" and is_mac(value) and not is_noise_mac(value)):
+                profile = self._profile(kind, value)
+                profile.credential_indicators.add(f"{item.get('type', 'HTTP credential')} username={item.get('username', '')}")
+                profile.warnings.add("Sensitive HTTP credential material observed in cleartext/decrypted traffic")
+                if host:
+                    profile.dns_queries.add(host)
+        self.result.credential_rows.append(
+            {
+                "Source": src_ip,
+                "Destination": dst_ip,
+                "Source MAC": src_mac if is_mac(src_mac) else "",
+                "Host": host,
+                "Type": item.get("type", ""),
+                "Username": item.get("username", ""),
+                "Secret/Hash": item.get("secret", ""),
+                "Field": field_name,
+                "Frame": row.get("frame.number", ""),
+                "URI": uri,
+            }
+        )
+
     def _service_hint(self, port: str, proto: str) -> str:
         names = {
             ("22", "tcp"): "SSH",
@@ -1950,6 +2634,8 @@ def render_device_profile(candidate: Candidate | None, result: AnalysisResult | 
         f"- OUI vendor/prefix: {profile.vendor or '-'}",
         f"- DHCP vendor/user class: {', '.join(sorted(profile.dhcp_vendor_classes)) or '-'}",
         f"- DHCP parameter list(s): {', '.join(sorted(profile.dhcp_parameter_lists)) or '-'}",
+        f"- Discovery protocol(s): {', '.join(sorted(profile.discovery_protocols)) or '-'}",
+        f"- Management IP(s): {', '.join(sorted(profile.management_ips, key=str)) or '-'}",
         f"- SSID(s): {', '.join(sorted(profile.ssids)) or '-'}",
         f"- BSSID(s): {', '.join(sorted(profile.bssids)) or '-'}",
         f"- Role hints: {', '.join(sorted(hint for hint in profile.role_hints if hint)) or '-'}",
@@ -1961,10 +2647,27 @@ def render_device_profile(candidate: Candidate | None, result: AnalysisResult | 
         f"- Subnet mask(s): {', '.join(sorted(profile.dhcp_subnet_masks)) or '-'}",
         f"- Requested/leased IP(s): {', '.join(sorted(profile.dhcp_requested_ips, key=str)) or '-'}",
         "",
+        "Mesh / Topology",
+        f"- Topology role(s): {', '.join(sorted(profile.topology_roles)) or '-'}",
+        f"- Mesh ID(s): {', '.join(sorted(profile.mesh_ids)) or '-'}",
+        f"- Mesh peer(s): {', '.join(sorted(profile.mesh_peers)) or '-'}",
+        f"- HWMP peer(s): {', '.join(sorted(profile.hwmp_peers)) or '-'}",
+        f"- WDS/backhaul peer(s): {', '.join(sorted(profile.wds_peers)) or '-'}",
+        f"- Neighbor report BSSID(s): {', '.join(sorted(profile.neighbor_bssids)) or '-'}",
+        f"- RNR BSSID(s): {', '.join(sorted(profile.rnr_bssids)) or '-'}",
+        f"- Mobility domain(s): {', '.join(sorted(profile.mobility_domains)) or '-'}",
+        f"- Vendor AP name/model/serial: {', '.join(sorted(profile.vendor_ap_names)) or '-'}",
+        f"- Vendor mesh clue(s): {', '.join(sorted(profile.vendor_mesh_clues)) or '-'}",
+        "",
         "Device",
         f"- Make: {profile.make or '-'}",
         f"- Model: {profile.model or '-'}",
+        f"- Platform: {profile.platform or '-'}",
+        f"- Software: {profile.software or '-'}",
         f"- Firmware: {profile.firmware or '-'}",
+        f"- Serial: {profile.serial or '-'}",
+        f"- Port/interface: {', '.join(sorted(profile.port_ids | profile.interface_names)) or '-'}",
+        f"- VLAN(s): {', '.join(sorted(profile.vlans)) or '-'}",
         "",
         "Radio",
         f"- Channel: {profile.channel or '-'}",
@@ -1991,6 +2694,8 @@ def render_device_profile(candidate: Candidate | None, result: AnalysisResult | 
         f"- DNS/name queries: {', '.join(sorted(profile.dns_queries)) or '-'}",
         f"- HTTP user agents: {', '.join(sorted(profile.http_user_agents)) or '-'}",
         f"- HTTP servers: {', '.join(sorted(profile.http_servers)) or '-'}",
+        f"- HTTP auth realms: {', '.join(sorted(profile.http_auth_realms)) or '-'}",
+        f"- Credential indicators: {', '.join(sorted(profile.credential_indicators)) or '-'}",
         f"- TLS SNI: {', '.join(sorted(profile.tls_sni)) or '-'}",
         f"- TLS JA3: {', '.join(sorted(profile.tls_ja3)) or '-'}",
         f"- Services: {', '.join(sorted(profile.services)) or '-'}",
@@ -2022,6 +2727,16 @@ def render_device_graph(candidate: Candidate | None, result: AnalysisResult | No
         lines.append(f"  -> Hostname {host}")
     for peer in sorted(profile.peers):
         lines.append(f"  -> Talks with {peer}")
+    for peer in sorted(profile.mesh_peers | profile.hwmp_peers):
+        lines.append(f"  -> Mesh peer {peer}")
+    for peer in sorted(profile.wds_peers):
+        lines.append(f"  -> WDS/backhaul peer {peer}")
+    for bssid in sorted(profile.neighbor_bssids):
+        lines.append(f"  -> Neighbor report BSSID {bssid}")
+    for bssid in sorted(profile.rnr_bssids):
+        lines.append(f"  -> RNR BSSID {bssid}")
+    for mesh_id in sorted(profile.mesh_ids):
+        lines.append(f"  -> Mesh ID {mesh_id}")
     for item in related:
         if item and item not in profile.bssids and item not in profile.ssids:
             lines.append(f"  -> Related {item}")
@@ -2076,6 +2791,7 @@ def run_cli(args: argparse.Namespace) -> int:
         mac_role=args.mac_role,
         password=args.password or "",
         temporal_key=args.tk or "",
+        analysis_level=args.analysis_level,
         tshark_path=args.tshark,
     ).analyze()
     if args.json:
@@ -2099,6 +2815,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mac-role", default="Unknown", choices=["Unknown", "BSSID", "Client", "Wired/Upstream", "MAC"])
     parser.add_argument("--password", default="", help="WPA password/PSK for decryption")
     parser.add_argument("--tk", default="", help="Temporal key or GTK for decryption")
+    parser.add_argument("--analysis-level", default="deep", choices=["basic", "moderate", "deep"], help="Analysis depth to run")
     parser.add_argument("--tshark", default="tshark", help="tshark executable path")
     parser.add_argument("--cli", action="store_true", help="Run once without the terminal GUI")
     parser.add_argument("--json", default="", help="Export JSON report path")
@@ -2258,6 +2975,11 @@ def main() -> int:
                     yield Input(value=self.initial_args.ip, placeholder="IPv4 / IPv6 address", id="ip")
                     yield Input(value=self.initial_args.password, placeholder="Password / PSK", password=True, id="password")
                     yield Input(value=self.initial_args.tk, placeholder="Temporal key / GTK", password=True, id="tk")
+                    yield Select(
+                        [("Basic", "basic"), ("Moderate", "moderate"), ("Deep", "deep")],
+                        value=self.initial_args.analysis_level,
+                        id="analysis-level",
+                    )
                 with Horizontal(id="actions"):
                     yield Button("Analyze", id="analyze", variant="primary")
                     yield Button("Export Report", id="export")
@@ -2298,6 +3020,10 @@ def main() -> int:
                         yield DataTable(id="ap-observations")
                     with TabPane("SSID Groups", id="ssid-groups-tab"):
                         yield DataTable(id="ssid-groups")
+                    with TabPane("Topology", id="topology-tab"):
+                        yield DataTable(id="topology")
+                    with TabPane("Discovery", id="discovery-tab"):
+                        yield DataTable(id="discovery")
                     with TabPane("Clients", id="clients-tab"):
                         yield DataTable(id="clients")
                     with TabPane("IP Devices", id="ip-devices-tab"):
@@ -2308,6 +3034,8 @@ def main() -> int:
                         yield DataTable(id="scans")
                     with TabPane("Open Services", id="open-services-tab"):
                         yield DataTable(id="open-services")
+                    with TabPane("HTTP URIs", id="http-uris-tab"):
+                        yield DataTable(id="http-uris")
                     with TabPane("Closed/Other Services", id="closed-services-tab"):
                         yield DataTable(id="closed-services")
                     with TabPane("Device Types", id="device-types-tab"):
@@ -2318,6 +3046,8 @@ def main() -> int:
                         yield DataTable(id="handshakes")
                     with TabPane("Decrypted", id="decrypted-tab"):
                         yield DataTable(id="decrypted")
+                    with TabPane("Credentials", id="credentials-tab"):
+                        yield DataTable(id="credentials")
                     with TabPane("Messages", id="messages-tab"):
                         yield Static("No messages yet.", id="messages")
                 with TabbedContent(id="detail"):
@@ -2345,16 +3075,20 @@ def main() -> int:
                 "aps": ["Rank", "BSSID", "SSIDs", "Channel", "All Channels", "Band", "Frequency", "All Freqs", "Best RSSI", "Avg RSSI", "Security", "Handshakes", "Sightings", "First Frame", "Last Frame", "Manufacturer", "Model", "Why"],
                 "ap-observations": ["BSSID", "SSID", "Channel", "HT Primary", "Frequency", "RSSI", "Manufacturer", "Model", "Device", "Why"],
                 "ssid-groups": ["SSID", "BSSIDs", "Bands", "Channels", "Best RSSI", "AP Count", "Ranks"],
+                "topology": ["Confidence", "Role Guess", "Device", "Kind", "Mesh ID", "Mesh Peers", "WDS Peers", "Neighbor BSSIDs", "RNR BSSIDs", "Mobility Domain", "Vendor/AP Name", "Sightings", "First Frame", "Last Frame", "Why"],
+                "discovery": ["Protocol", "MAC", "IP", "Hostname/ID", "Platform/Model", "Software/Firmware", "Port/Interface", "Uptime/TTL", "Role Hints", "Sightings", "First Frame", "Last Frame"],
                 "clients": ["BSSID", "MAC", "Role", "Why"],
                 "ip-devices": ["IP", "Evidence", "Scope", "MAC", "Hostnames", "Role Hints", "DHCP Server", "Router", "DNS Servers", "Open TCP", "Protocols", "Peers", "DNS Queries", "First Frame", "Last Frame", "Sightings"],
                 "conversations": ["Source IP", "Destination IP", "Source MAC", "Destination MAC", "Protocol", "Source Port", "Destination Port", "Frames"],
                 "scans": ["Scanner", "Targets", "Responsive", "Target Sample", "Open Ports Seen"],
                 "open-services": ["IP", "Port", "Proto", "State", "Service Hint"],
+                "http-uris": ["IP", "Port", "Host", "Status", "URI", "Server", "Source", "Frame"],
                 "closed-services": ["IP", "Port", "Proto", "State", "Service Hint"],
                 "device-types": ["Kind", "Value", "Best Guess", "Confidence", "Alternatives", "Top Evidence"],
                 "security": ["BSSID", "Pairwise Cipher", "AKM", "MFPR", "MFPC"],
                 "handshakes": ["Frame", "BSSID", "Source", "Destination", "EAPOL Msg", "PMKID", "GTK", "Why"],
                 "decrypted": ["Frame", "Protocol", "BSSID", "Source MAC", "Destination MAC", "Source IP", "Destination IP"],
+                "credentials": ["Source", "Destination", "Source MAC", "Host", "Type", "Username", "Secret/Hash", "Field", "Frame", "URI"],
             }
             for table_id, columns in table_specs.items():
                 table = self.query_one(f"#{table_id}", DataTable)
@@ -2387,6 +3121,7 @@ def main() -> int:
                 "mac_role": str(self.query_one("#mac-role", Select).value),
                 "password": self.query_one("#password", Input).value,
                 "temporal_key": self.query_one("#tk", Input).value,
+                "analysis_level": str(self.query_one("#analysis-level", Select).value),
                 "tshark_path": self.initial_args.tshark,
             }
             self.run_analysis(params)
@@ -2404,21 +3139,25 @@ def main() -> int:
             self._fill_rows("aps", self._filtered_ap_rows(result.ap_rows))
             self._fill_rows("ap-observations", result.ap_observation_rows)
             self._fill_rows("ssid-groups", result.ssid_group_rows)
+            self._fill_rows("topology", result.topology_rows)
+            self._fill_rows("discovery", result.discovery_rows)
             self._fill_rows("clients", result.client_rows)
             self._fill_rows("ip-devices", self._filtered_ip_rows(result.ip_device_rows))
             self._fill_rows("conversations", result.conversation_rows)
             self._fill_rows("scans", result.scan_rows)
             self._fill_rows("open-services", result.open_service_rows)
+            self._fill_rows("http-uris", result.http_uri_rows)
             self._fill_rows("closed-services", result.closed_service_rows)
             self._fill_rows("device-types", result.device_type_rows)
             self._fill_rows("security", result.security_rows)
             self._fill_rows("handshakes", result.handshake_rows)
             self._fill_rows("decrypted", result.decrypted_rows)
+            self._fill_rows("credentials", result.credential_rows)
             self.query_one("#messages", Static).update("\n".join(result.messages) if result.messages else "No messages.")
             self.query_one("#status", Static).update(f"Done. {len(result.candidates)} identifiers found. Select any row for Evidence, Profile, and Graph.")
 
         def _clear_tables(self) -> None:
-            for table_id in ["candidates", "aps", "ap-observations", "ssid-groups", "clients", "ip-devices", "conversations", "scans", "open-services", "closed-services", "device-types", "security", "handshakes", "decrypted"]:
+            for table_id in ["candidates", "aps", "ap-observations", "ssid-groups", "topology", "discovery", "clients", "ip-devices", "conversations", "scans", "open-services", "http-uris", "closed-services", "device-types", "security", "handshakes", "decrypted", "credentials"]:
                 self.query_one(f"#{table_id}", DataTable).clear()
             self.query_one("#messages", Static).update("Working...")
             self.query_one("#evidence-detail", Static).update("Select a row to see why it was identified as related.")
@@ -2450,6 +3189,16 @@ def main() -> int:
         def _candidate_key_from_row(self, row: dict[str, str]) -> str:
             if row.get("Kind") and row.get("Value"):
                 key = f"{row.get('Kind')}:{normalize_ip(row.get('Value', '')) if row.get('Kind') == 'IP' else normalize_mac(row.get('Value', '')) if row.get('Kind') in {'BSSID', 'Client', 'Wired/Upstream', 'MAC'} else row.get('Value')}"
+                if key in self.candidate_by_key:
+                    return key
+            if row.get("Kind") and row.get("Device"):
+                kind = row.get("Kind", "")
+                key = f"{kind}:{normalize_mac(row.get('Device', '')) if kind in {'BSSID', 'Client', 'Wired/Upstream', 'MAC'} else row.get('Device', '')}"
+                if key in self.candidate_by_key:
+                    return key
+            for kind, field_name in [("MAC", "MAC"), ("IP", "IP"), ("Hostname", "Hostname/ID"), ("IP", "Source"), ("MAC", "Source MAC"), ("IP", "Destination"), ("Hostname", "Host")]:
+                value = row.get(field_name, "")
+                key = f"{kind}:{normalize_mac(value) if kind == 'MAC' else normalize_ip(value) if kind == 'IP' else value}"
                 if key in self.candidate_by_key:
                     return key
             for kind, field_name in [("BSSID", "BSSID"), ("Client", "MAC"), ("Wired/Upstream", "MAC"), ("MAC", "Source MAC"), ("MAC", "Destination MAC"), ("IP", "IP"), ("IP", "Source IP"), ("IP", "Destination IP"), ("IP", "Scanner"), ("SSID", "SSID")]:
@@ -2568,6 +3317,7 @@ def main() -> int:
                 "Targets",
                 "Responsive",
                 "Port",
+                "Frame",
             }
             rank_order = {"Primary": 0, "Related": 1, "Possible": 2, "Weak": 3}
 
